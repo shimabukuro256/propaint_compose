@@ -1,7 +1,7 @@
 package com.propaint.app.viewmodel
 
+import android.app.Application
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -9,10 +9,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import com.propaint.app.model.*
+import java.io.File
 
-class PaintViewModel : ViewModel() {
+class PaintViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val historyCache = HistoryDiskCache(File(application.cacheDir, "paint_history"))
 
     // ── Brush ──
     var brushSettings by mutableStateOf(BrushSettings())
@@ -24,6 +27,8 @@ class PaintViewModel : ViewModel() {
         Color.Green, Color.Yellow, Color(0xFFFF6600), Color(0xFF9900FF),
     )
 
+    private val brushSettingsMap = HashMap<BrushType, BrushSettings>()
+
     // ── Layers ──
     val layers = mutableStateListOf(PaintLayer(name = "レイヤー 1"))
     var activeLayerId by mutableStateOf(layers.first().id)
@@ -33,8 +38,6 @@ class PaintViewModel : ViewModel() {
         get() = layers.find { it.id == activeLayerId }
 
     // ── Drawing state ──
-    // 通常の ArrayList を使用し Compose スナップショット追跡コストを排除する。
-    // 読み取り側は strokeVersion を observe して再描画トリガーとする。
     private val _currentStrokePoints = ArrayList<StrokePoint>(256)
     val currentStrokePoints: List<StrokePoint> get() = _currentStrokePoints
     var strokeVersion by mutableIntStateOf(0)
@@ -42,11 +45,29 @@ class PaintViewModel : ViewModel() {
     var isDrawing by mutableStateOf(false)
         private set
 
+    // ── Canvas pixel capture (for Fude / Watercolor / Marker / Blur) ──
+    private var capturedPixels: ByteArray? = null
+    private var capturedW: Int = 0
+    private var capturedH: Int = 0
+
+    fun setPixelCapture(pixels: ByteArray, w: Int, h: Int) {
+        capturedPixels = pixels; capturedW = w; capturedH = h
+    }
+
+    fun clearPixelCapture() { capturedPixels = null }
+
     // ── Canvas view ──
-    var zoom by mutableFloatStateOf(1f)
+    data class ViewTransform(
+        val zoom: Float = 1f,
+        val panX: Float = 0f,
+        val panY: Float = 0f,
+        val rotation: Float = 0f,
+    )
+    var viewTransform by mutableStateOf(ViewTransform())
         private set
-    var panOffset by mutableStateOf(Offset.Zero)
-        private set
+    val zoom: Float get() = viewTransform.zoom
+    val panOffset: Offset get() = Offset(viewTransform.panX, viewTransform.panY)
+    val rotation: Float get() = viewTransform.rotation
 
     // ── Options ──
     var showGrid by mutableStateOf(false)
@@ -54,56 +75,37 @@ class PaintViewModel : ViewModel() {
     var symmetryEnabled by mutableStateOf(false)
         private set
 
-    // ── Watercolor color sampler ──
-    // DrawingCanvas がストローク開始前にオフスクリーンビットマップをキャプチャし、
-    // このラムダをセットする。呼び出し元はキャンバス座標を渡すと既存ピクセル色を返す。
-    var colorSampler: ((Offset) -> Color)? = null
-
     // ── History ──
-    private val undoStack = mutableListOf<CanvasAction>()
-    private val redoStack = mutableListOf<CanvasAction>()
-    private val maxHistory = 50
+    private val undoStack = HybridHistoryStack(historyCache, maxMemory = 10, maxTotal = 50)
+    private val redoStack = HybridHistoryStack(
+        HistoryDiskCache(File(getApplication<Application>().cacheDir, "paint_history_redo")),
+        maxMemory = 10, maxTotal = 50,
+    )
 
-    val canUndo get() = undoStack.isNotEmpty()
-    val canRedo get() = redoStack.isNotEmpty()
+    val canUndo get() = undoStack.isNotEmpty
+    val canRedo get() = redoStack.isNotEmpty
 
     // ── Brush ──
 
     fun setBrush(settings: BrushSettings) {
         brushSettings = settings
+        brushSettingsMap[settings.type] = settings
     }
 
     fun selectBrushType(type: BrushType) {
-        brushSettings = BrushSettings(type = type)
+        brushSettingsMap[brushSettings.type] = brushSettings
+        brushSettings = brushSettingsMap[type] ?: BrushSettings(type = type)
     }
 
-    fun setBrushSize(size: Float) {
-        brushSettings = brushSettings.copy(size = size.coerceIn(1f, 200f))
-    }
-
-    fun setBrushOpacity(opacity: Float) {
-        brushSettings = brushSettings.copy(opacity = opacity.coerceIn(0.01f, 1f))
-    }
-
-    fun setBrushDensity(density: Float) {
-        brushSettings = brushSettings.copy(density = density.coerceIn(0.01f, 1f))
-    }
-
-    fun setBrushSpacing(spacing: Float) {
-        brushSettings = brushSettings.copy(spacing = spacing.coerceIn(0.1f, 5.0f))
-    }
-
-    fun togglePressureSize() {
-        brushSettings = brushSettings.copy(pressureSizeEnabled = !brushSettings.pressureSizeEnabled)
-    }
-
-    fun togglePressureOpacity() {
-        brushSettings = brushSettings.copy(pressureOpacityEnabled = !brushSettings.pressureOpacityEnabled)
-    }
-
-    fun togglePressureBlend() {
-        brushSettings = brushSettings.copy(pressureBlendEnabled = !brushSettings.pressureBlendEnabled)
-    }
+    fun setBrushSize(size: Float) { setBrush(brushSettings.copy(size = size.coerceIn(1f, 200f))) }
+    fun setBrushOpacity(opacity: Float) { setBrush(brushSettings.copy(opacity = opacity.coerceIn(0.01f, 1f))) }
+    fun setBrushDensity(density: Float) { setBrush(brushSettings.copy(density = density.coerceIn(0.01f, 1f))) }
+    fun setBrushSpacing(spacing: Float) { setBrush(brushSettings.copy(spacing = spacing.coerceIn(0.01f, 2.0f))) }
+    fun setBrushHardness(hardness: Float) { setBrush(brushSettings.copy(hardness = hardness.coerceIn(0f, 1f))) }
+    fun setBrushStabilizer(stabilizer: Float) { setBrush(brushSettings.copy(stabilizer = stabilizer.coerceIn(0f, 1f))) }
+    fun setBrushBlurStrength(v: Float) { setBrush(brushSettings.copy(blurStrength = v.coerceIn(0.05f, 1f))) }
+    fun togglePressureSize() { setBrush(brushSettings.copy(pressureSizeEnabled = !brushSettings.pressureSizeEnabled)) }
+    fun togglePressureOpacity() { setBrush(brushSettings.copy(pressureOpacityEnabled = !brushSettings.pressureOpacityEnabled)) }
 
     // ── Color ──
 
@@ -115,6 +117,71 @@ class PaintViewModel : ViewModel() {
         }
     }
 
+    // ── Pixel sampling helpers ──
+
+    /** キャンバス座標 (Y上向き=画面上端) から GL ピクセルバッファをサンプル */
+    private fun samplePixelAt(position: Offset): Color? {
+        val pixels = capturedPixels ?: return null
+        val w = capturedW; val h = capturedH
+        val px = position.x.toInt().coerceIn(0, w - 1)
+        val py = (h - 1 - position.y.toInt()).coerceIn(0, h - 1)
+        val off = (py * w + px) * 4
+        return Color(
+            red   = (pixels[off    ].toInt() and 0xFF) / 255f,
+            green = (pixels[off + 1].toInt() and 0xFF) / 255f,
+            blue  = (pixels[off + 2].toInt() and 0xFF) / 255f,
+            alpha = (pixels[off + 3].toInt() and 0xFF) / 255f,
+        )
+    }
+
+    /** ボックスブラー: position 周辺 radius ピクセルを平均 */
+    private fun sampleBoxBlurAt(position: Offset, radius: Int): Color? {
+        val pixels = capturedPixels ?: return null
+        val w = capturedW; val h = capturedH
+        var r = 0f; var g = 0f; var b = 0f; var a = 0f; var count = 0
+        val cx = position.x.toInt(); val cy = position.y.toInt()
+        for (sy in (cy - radius)..(cy + radius)) {
+            for (sx in (cx - radius)..(cx + radius)) {
+                val px = sx.coerceIn(0, w - 1)
+                val py = (h - 1 - sy).coerceIn(0, h - 1)
+                val off = (py * w + px) * 4
+                r += (pixels[off    ].toInt() and 0xFF) / 255f
+                g += (pixels[off + 1].toInt() and 0xFF) / 255f
+                b += (pixels[off + 2].toInt() and 0xFF) / 255f
+                a += (pixels[off + 3].toInt() and 0xFF) / 255f
+                count++
+            }
+        }
+        if (count == 0) return null
+        return Color(r / count, g / count, b / count, a / count)
+    }
+
+    /**
+     * ブラシ種別に応じたキャンバス混色計算。
+     * - Fude / Marker : サンプル1点 → density 割合でブラシ色と線形補間
+     * - Watercolor    : ボックスブラー → density 割合でブラシ色と線形補間
+     * - Blur          : ボックスブラーのみ (ブラシ色なし)
+     */
+    private fun canvasMix(position: Offset, pressure: Float): Color? {
+        return when (brushSettings.type) {
+            BrushType.Fude, BrushType.Marker -> {
+                val sampled = samplePixelAt(position) ?: return null
+                val strength = brushSettings.density.coerceIn(0.1f, 0.9f)
+                lerp(sampled, currentColor, strength)
+            }
+            BrushType.Watercolor -> {
+                val blurred = sampleBoxBlurAt(position, 3) ?: return null
+                val strength = (brushSettings.density * 0.7f + 0.1f).coerceIn(0.05f, 0.95f)
+                lerp(blurred, currentColor, strength)
+            }
+            BrushType.Blur -> {
+                val radius = (brushSettings.blurStrength * 8f).toInt().coerceIn(1, 8)
+                sampleBoxBlurAt(position, radius)
+            }
+            else -> null
+        }
+    }
+
     // ── Drawing ──
 
     fun startStroke(position: Offset, pressure: Float = 1f) {
@@ -122,7 +189,7 @@ class PaintViewModel : ViewModel() {
         if (layer.isLocked) return
         isDrawing = true
         _currentStrokePoints.clear()
-        _currentStrokePoints.add(StrokePoint(position, pressure, watercolorMix(position, pressure)))
+        _currentStrokePoints.add(StrokePoint(position, pressure, canvasMix(position, pressure)))
         strokeVersion++
     }
 
@@ -132,41 +199,14 @@ class PaintViewModel : ViewModel() {
             val last = _currentStrokePoints.last()
             val dist = (position - last.position).getDistance()
             if (dist < 1f) return
-            // Smoothing
-            val s = brushSettings.type.smoothing * 0.5f
+            val s = brushSettings.stabilizer * 0.5f
             val smoothed = Offset(
                 last.position.x + (position.x - last.position.x) * (1f - s),
                 last.position.y + (position.y - last.position.y) * (1f - s),
             )
-            _currentStrokePoints.add(StrokePoint(smoothed, pressure, watercolorMix(smoothed, pressure)))
+            _currentStrokePoints.add(StrokePoint(smoothed, pressure, canvasMix(smoothed, pressure)))
             strokeVersion++
         }
-    }
-
-    /**
-     * 水彩ブラシ専用: キャンバスの既存色を [colorSampler] でサンプリングし、
-     * [currentColor] と線形補間した混色結果を返す。
-     * 非水彩ブラシや sampler 未設定時は null を返す（stroke.color をそのまま使用）。
-     *
-     * blendStrength = 描画色の支配度 (0=全サンプリング色, 1=全描画色)
-     *  - pressureBlendEnabled OFF: 固定 0.5 (SAI デフォルトに近い 50/50 混色)
-     *  - pressureBlendEnabled ON : 筆圧に比例 (軽=キャンバス色優位, 強=描画色優位)
-     */
-    private fun watercolorMix(position: Offset, pressure: Float): Color? {
-        if (brushSettings.type != BrushType.Watercolor) return null
-        val sampled = colorSampler?.invoke(position) ?: return null
-        val blendStrength = if (brushSettings.pressureBlendEnabled)
-            (0.15f + 0.85f * pressure).coerceIn(0f, 1f)
-        else 0.5f
-        // RGB: キャンバス色と描画色を blendStrength で線形補間
-        val newMix = lerp(sampled, currentColor, blendStrength)
-        // Alpha: 同じアルゴリズム — キャンバスの不透明度とブラシ濃度を同比率で混色
-        // density = スタンプ 1 回の塗り量上限（opacity は saveLayer 側で管理）
-        val mixedAlpha = sampled.alpha + (brushSettings.density - sampled.alpha) * blendStrength
-        val newMixWithAlpha = newMix.copy(alpha = mixedAlpha)
-        // 時系列スムージング: 前ポイントの混色結果と補間し、急激な色変化を抑える
-        val prevColor = _currentStrokePoints.lastOrNull()?.color ?: newMixWithAlpha
-        return lerp(prevColor, newMixWithAlpha, 0.35f)
     }
 
     fun endStroke() {
@@ -175,9 +215,9 @@ class PaintViewModel : ViewModel() {
 
         if (_currentStrokePoints.size >= 2) {
             val stroke = Stroke(
-                points = _currentStrokePoints.toList(),
-                brush = brushSettings.copy(),
-                color = currentColor,
+                points  = _currentStrokePoints.toList(),
+                brush   = brushSettings.copy(),
+                color   = currentColor,
                 layerId = activeLayerId,
             )
             val idx = layers.indexOfFirst { it.id == activeLayerId }
@@ -196,9 +236,10 @@ class PaintViewModel : ViewModel() {
     fun addLayer() {
         val newLayer = PaintLayer(name = "レイヤー ${layers.size + 1}")
         val idx = layers.indexOfFirst { it.id == activeLayerId }
-        layers.add(idx + 1, newLayer)
+        val insertAt = idx + 1
+        layers.add(insertAt, newLayer)
         activeLayerId = newLayer.id
-        pushUndo(CanvasAction.AddLayer(newLayer))
+        pushUndo(CanvasAction.AddLayer(newLayer, insertAt))
     }
 
     fun removeLayer(layerId: String) {
@@ -248,11 +289,13 @@ class PaintViewModel : ViewModel() {
         if (idx < 0) return
         val source = layers[idx]
         val copy = source.copy(
-            id = java.util.UUID.randomUUID().toString(),
+            id   = java.util.UUID.randomUUID().toString(),
             name = "${source.name} コピー",
         )
-        layers.add(idx + 1, copy)
+        val insertAt = idx + 1
+        layers.add(insertAt, copy)
         activeLayerId = copy.id
+        pushUndo(CanvasAction.DuplicateLayer(copy, insertAt))
     }
 
     fun mergeDown(layerId: String) {
@@ -263,40 +306,54 @@ class PaintViewModel : ViewModel() {
         layers[idx - 1] = lower.copy(strokes = lower.strokes + upper.strokes)
         layers.removeAt(idx)
         activeLayerId = layers[idx - 1].id
+        pushUndo(CanvasAction.MergeDown(upper, lower, idx))
     }
 
     // ── View ──
 
-    fun updateZoom(z: Float) { zoom = z.coerceIn(0.1f, 10f) }
-    fun updatePanOffset(offset: Offset) { panOffset = offset }
-    fun resetView() { zoom = 1f; panOffset = Offset.Zero }
+    fun updateViewTransform(zoom: Float, pan: Offset, rotation: Float = viewTransform.rotation) {
+        viewTransform = ViewTransform(zoom.coerceIn(0.1f, 10f), pan.x, pan.y, rotation)
+    }
+    fun updateZoom(z: Float) { viewTransform = viewTransform.copy(zoom = z.coerceIn(0.1f, 10f)) }
+    fun updatePanOffset(offset: Offset) { viewTransform = viewTransform.copy(panX = offset.x, panY = offset.y) }
+    fun resetView() { viewTransform = ViewTransform() }
     fun toggleGrid() { showGrid = !showGrid }
     fun toggleSymmetry() { symmetryEnabled = !symmetryEnabled }
 
     // ── Undo / Redo ──
 
     private fun pushUndo(action: CanvasAction) {
-        undoStack.add(action)
-        if (undoStack.size > maxHistory) undoStack.removeAt(0)
+        undoStack.push(action)
         redoStack.clear()
     }
 
     fun undo() {
-        val action = undoStack.removeLastOrNull() ?: return
+        val action = undoStack.pop() ?: return
+        applyUndo(action)
+        redoStack.push(action)
+    }
+
+    fun redo() {
+        val action = redoStack.pop() ?: return
+        applyRedo(action)
+        undoStack.push(action)
+    }
+
+    private fun applyUndo(action: CanvasAction) {
         when (action) {
             is CanvasAction.AddStroke -> {
                 val idx = layers.indexOfFirst { it.id == action.layerId }
                 if (idx >= 0) {
                     val l = layers[idx]
-                    if (l.strokes.isNotEmpty()) {
-                        layers[idx] = l.copy(strokes = l.strokes.dropLast(1))
-                    }
+                    if (l.strokes.isNotEmpty()) layers[idx] = l.copy(strokes = l.strokes.dropLast(1))
                 }
             }
             is CanvasAction.AddLayer -> {
-                layers.removeAll { it.id == action.layer.id }
-                if (activeLayerId == action.layer.id && layers.isNotEmpty()) {
-                    activeLayerId = layers.last().id
+                val idx = layers.indexOfFirst { it.id == action.layer.id }
+                if (idx >= 0) {
+                    layers.removeAt(idx)
+                    if (activeLayerId == action.layer.id && layers.isNotEmpty())
+                        activeLayerId = layers[maxOf(0, idx - 1)].id
                 }
             }
             is CanvasAction.RemoveLayer -> {
@@ -306,31 +363,63 @@ class PaintViewModel : ViewModel() {
                 val idx = layers.indexOfFirst { it.id == action.layerId }
                 if (idx >= 0) layers[idx] = layers[idx].copy(strokes = action.previousStrokes)
             }
+            is CanvasAction.MergeDown -> {
+                // merged に upper の strokes が付いているので分割
+                val mergedIdx = layers.indexOfFirst { it.id == action.lower.id }
+                if (mergedIdx >= 0) {
+                    layers[mergedIdx] = action.lower
+                    layers.add(mergedIdx + 1, action.upper)
+                    activeLayerId = action.upper.id
+                }
+            }
+            is CanvasAction.DuplicateLayer -> {
+                val idx = layers.indexOfFirst { it.id == action.newLayer.id }
+                if (idx >= 0) {
+                    layers.removeAt(idx)
+                    if (activeLayerId == action.newLayer.id && layers.isNotEmpty())
+                        activeLayerId = layers[maxOf(0, idx - 1)].id
+                }
+            }
         }
-        redoStack.add(action)
     }
 
-    fun redo() {
-        val action = redoStack.removeLastOrNull() ?: return
+    private fun applyRedo(action: CanvasAction) {
         when (action) {
             is CanvasAction.AddStroke -> {
                 val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) {
-                    layers[idx] = layers[idx].copy(strokes = layers[idx].strokes + action.stroke)
-                }
+                if (idx >= 0) layers[idx] = layers[idx].copy(strokes = layers[idx].strokes + action.stroke)
             }
             is CanvasAction.AddLayer -> {
-                layers.add(action.layer)
+                layers.add(minOf(action.atIndex, layers.size), action.layer)
                 activeLayerId = action.layer.id
             }
             is CanvasAction.RemoveLayer -> {
-                layers.removeAll { it.id == action.layer.id }
+                val idx = layers.indexOfFirst { it.id == action.layer.id }
+                if (idx >= 0) layers.removeAt(idx)
             }
             is CanvasAction.ClearLayer -> {
                 val idx = layers.indexOfFirst { it.id == action.layerId }
                 if (idx >= 0) layers[idx] = layers[idx].copy(strokes = emptyList())
             }
+            is CanvasAction.MergeDown -> {
+                val lowerIdx = layers.indexOfFirst { it.id == action.lower.id }
+                val upperIdx = layers.indexOfFirst { it.id == action.upper.id }
+                if (lowerIdx >= 0 && upperIdx >= 0) {
+                    layers[lowerIdx] = action.lower.copy(strokes = action.lower.strokes + action.upper.strokes)
+                    layers.removeAt(upperIdx)
+                    activeLayerId = layers[lowerIdx].id
+                }
+            }
+            is CanvasAction.DuplicateLayer -> {
+                layers.add(minOf(action.atIndex, layers.size), action.newLayer)
+                activeLayerId = action.newLayer.id
+            }
         }
-        undoStack.add(action)
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        undoStack.clear()
+        redoStack.clear()
     }
 }

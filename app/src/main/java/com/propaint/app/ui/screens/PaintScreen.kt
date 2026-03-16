@@ -12,68 +12,74 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.propaint.app.ui.components.*
 import com.propaint.app.viewmodel.PaintViewModel
 
+// TopBar の高さ: 行1(44dp) + 区切り(0.5dp) + 行2(50dp) ≈ 95dp
+private val TOP_BAR_HEIGHT = 95.dp
+
 @Composable
 fun PaintScreen(vm: PaintViewModel = viewModel()) {
-    var showBrush by remember { mutableStateOf(false) }
-    var showColor by remember { mutableStateOf(false) }
+    var showBrush  by remember { mutableStateOf(false) }
+    var showColor  by remember { mutableStateOf(false) }
     var showLayers by remember { mutableStateOf(false) }
 
-    fun closeAll() { showBrush = false; showColor = false; showLayers = false }
+    Box(modifier = Modifier.fillMaxSize()) {
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Top toolbar
-        TopToolbar(
-            vm = vm,
-            onBrushPanel = {
-                showBrush = !showBrush; showColor = false; showLayers = false
-            },
-            onColorPicker = {
-                showColor = !showColor; showBrush = false; showLayers = false
-            },
-            onLayerPanel = {
-                showLayers = !showLayers; showBrush = false; showColor = false
-            },
+        // ── キャンバス (画面全体) ────────────────────────────────────────
+        DrawingCanvas(viewModel = vm, modifier = Modifier.fillMaxSize())
+
+        // ── 浮遊 TopBar (2 行) ───────────────────────────────────────────
+        TopBar(
+            vm            = vm,
+            onColorPicker = { showColor = !showColor;  showBrush = false; showLayers = false },
+            onLayerPanel  = { showLayers = !showLayers; showBrush = false; showColor = false },
+            onBrushPanel  = { showBrush = !showBrush;  showColor = false; showLayers = false },
+            modifier      = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth(),
         )
 
-        // Main content
-        Row(modifier = Modifier.weight(1f)) {
-            // Left panel: brush or color
-            AnimatedVisibility(
-                visible = showBrush,
-                enter = slideInHorizontally { -it },
-                exit = slideOutHorizontally { -it },
-            ) {
-                BrushPanel(vm = vm, onClose = { showBrush = false })
-            }
+        // ── 左サイドクイックバー (TopBar の下に配置・重ならないよう) ───
+        SideQuickBar(
+            vm       = vm,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = TOP_BAR_HEIGHT, start = 0.dp)
+                .fillMaxHeight(0.65f),
+        )
 
-            AnimatedVisibility(
-                visible = showColor,
-                enter = slideInHorizontally { -it },
-                exit = slideOutHorizontally { -it },
-            ) {
-                ColorPickerPanel(vm = vm, onClose = { showColor = false })
-            }
+        // ── ブラシパネル (左からスライドイン) ────────────────────────────
+        AnimatedVisibility(
+            visible  = showBrush,
+            enter    = slideInHorizontally { -it },
+            exit     = slideOutHorizontally { -it },
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = TOP_BAR_HEIGHT),
+        ) {
+            BrushPanel(vm = vm, onClose = { showBrush = false })
+        }
 
-            // Canvas (fills remaining space)
-            Box(modifier = Modifier.weight(1f)) {
-                DrawingCanvas(viewModel = vm)
+        // ── カラーピッカー (左からスライドイン) ──────────────────────────
+        AnimatedVisibility(
+            visible  = showColor,
+            enter    = slideInHorizontally { -it },
+            exit     = slideOutHorizontally { -it },
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = TOP_BAR_HEIGHT),
+        ) {
+            ColorPickerPanel(vm = vm, onClose = { showColor = false })
+        }
 
-                // Side quick bar (floating left)
-                SideQuickBar(
-                    vm = vm,
-                    modifier = Modifier.align(Alignment.CenterStart)
-                        .padding(start = 8.dp),
-                )
-            }
-
-            // Right panel: layers
-            AnimatedVisibility(
-                visible = showLayers,
-                enter = slideInHorizontally { it },
-                exit = slideOutHorizontally { it },
-            ) {
-                LayerPanel(vm = vm, onClose = { showLayers = false })
-            }
+        // ── レイヤーパネル (右からスライドイン) ──────────────────────────
+        AnimatedVisibility(
+            visible  = showLayers,
+            enter    = slideInHorizontally { it },
+            exit     = slideOutHorizontally { it },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = TOP_BAR_HEIGHT),
+        ) {
+            LayerPanel(vm = vm, onClose = { showLayers = false })
         }
     }
 }

@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- OpenGL ES 2.0 を必須とする -->
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+
     <application
         android:name=".ProPaintApp"
         android:allowBackup="true"
