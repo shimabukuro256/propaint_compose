@@ -5,6 +5,7 @@ import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import androidx.compose.ui.graphics.Color
 import com.propaint.app.model.*
+import com.propaint.app.model.needsWetCanvas
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicReference
@@ -55,6 +56,17 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
     private val watercolorCaptureRequest =
         AtomicReference<Pair<String, (ByteArray, Int, Int) -> Unit>?>()
 
+    // コンポジットキャプチャリクエスト (スポイト用)
+    private val compositeCaptureRequest =
+        AtomicReference<((ByteArray, Int, Int) -> Unit)?>()
+
+    // 全レイヤーキャプチャリクエスト (PSD エクスポート用)
+    private data class AllLayersCaptureReq(
+        val layerIds: List<String>,
+        val callback: (List<Pair<String, ByteArray>>, Int, Int) -> Unit,
+    )
+    private val allLayersCaptureRequest = AtomicReference<AllLayersCaptureReq?>()
+
     var surfaceWidth  = 0; private set
     var surfaceHeight = 0; private set
 
@@ -80,18 +92,27 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
 
     // ── ライブストローク FBO ─────────────────────────────────────────────
     //
-    // strokeSnapshotFbo: ストローク開始時の layerFbo のコピー (読み取り専用)
-    // strokeMarksFbo   : 現在ストロークの全スタンプ蓄積 (opacity 適用前)
-    // liveStrokeFbo    : snapshot + marks×opacity の合成結果 (合成表示・確定用)
+    // 【通常ブラシ (Pencil / Marker / Airbrush)】
+    //   strokeSnapshotFbo: ストローク開始時の layerFbo のコピー (読み取り専用)
+    //   strokeMarksFbo   : 現在ストロークの全スタンプ蓄積 (opacity 適用前)
+    //   liveStrokeFbo    : snapshot + marks×opacity の合成結果 (表示・確定用)
+    //
+    // 【水彩系ブラシ (Fude / Watercolor / Blur) — ウェットキャンバス方式】
+    //   wetCanvasFbo     : layerFbo のコピーとして開始し、スタンプを直接書き込む
+    //   liveStrokeFbo    = wetCanvasFbo (同じオブジェクト)
+    //   → 各スタンプが既存ピクセルと即座にブレンドされ、真の混色が実現する
+    //   → ストローク中に周期的に wetCanvasFbo を再キャプチャし CPU 側混色も更新
     //
     // Eraser は直接 liveStrokeFbo へ描画 (destination-out で opacity 上限不要)。
-    private var strokeSnapshotFbo:     LayerFbo? = null
-    private var strokeMarksFbo:        LayerFbo? = null
-    private var liveStrokeFbo:         LayerFbo? = null
-    private var liveStrokeActiveLayerId: String? = null
-    private var lastLivePointCount:    Int = 0
-    private var liveDistToNextStamp:   Float = 0f
-    private var liveIsEraser:          Boolean = false
+    private var strokeSnapshotFbo:       LayerFbo? = null
+    private var strokeMarksFbo:          LayerFbo? = null
+    private var liveStrokeFbo:           LayerFbo? = null
+    private var wetCanvasFbo:            LayerFbo? = null   // 水彩系ブラシ専用
+    private var liveStrokeActiveLayerId: String?  = null
+    private var lastLivePointCount:      Int      = 0
+    private var liveDistToNextStamp:     Float    = 0f
+    private var liveIsEraser:            Boolean  = false
+    private var liveIsMixing:            Boolean  = false   // 水彩系フラグ
     // endStroke 直後にスワップ待ちのレイヤー ID
     private var pendingLiveMergeLayerId: String? = null
 
@@ -142,6 +163,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         strokeSnapshotFbo?.delete(); strokeSnapshotFbo = null
         strokeMarksFbo?.delete();    strokeMarksFbo    = null
         liveStrokeFbo?.delete();     liveStrokeFbo     = null
+        wetCanvasFbo?.delete();      wetCanvasFbo      = null
         bakingMarksFbo?.delete();    bakingMarksFbo    = null
         compositeCache?.delete();    compositeCache    = null
         compA?.delete(); compA = LayerFbo(width, height)
@@ -151,6 +173,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         lastLivePointCount      = 0
         liveDistToNextStamp     = 0f
         liveIsEraser            = false
+        liveIsMixing            = false
         pendingLiveMergeLayerId = null
 
         lastLiveSize   = -1
@@ -204,6 +227,27 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         if (contentChanged) buildCompositeCache(snap, w, h, cache)
 
         drawCacheToScreen(snap, w, h, cache)
+
+        // コンポジットキャプチャリクエストの処理 (スポイト用)
+        compositeCaptureRequest.getAndSet(null)?.let { cb ->
+            captureCompositePixels(cb)
+        }
+
+        // 全レイヤーキャプチャリクエストの処理 (PSD エクスポート用)
+        allLayersCaptureRequest.getAndSet(null)?.let { req ->
+            val result = mutableListOf<Pair<String, ByteArray>>()
+            for (id in req.layerIds) {
+                val fbo = layerFbos[id] ?: continue
+                fbo.bind()
+                val bb = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+                GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                bb.position(0)
+                val bytes = ByteArray(w * h * 4); bb.get(bytes)
+                result.add(Pair(id, bytes))
+            }
+            req.callback(result, w, h)
+        }
     }
 
     // ── ライブストローク FBO ──────────────────────────────────────────────
@@ -230,65 +274,96 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         val layerId  = snap.activeLayerId
         val brush    = snap.currentBrush
         val isEraser = brush.type == BrushType.Eraser
+        val isMixing = brush.type.needsWetCanvas
         val isNew    = layerId != liveStrokeActiveLayerId ||
                        newCount < lastLivePointCount ||
-                       isEraser != liveIsEraser
+                       isEraser != liveIsEraser ||
+                       isMixing != liveIsMixing
 
         if (isNew || liveStrokeFbo == null) {
-            // ── ストローク開始: スナップショットを各 FBO へコピー ──────────
             val srcFbo = layerFbos[layerId]
 
-            // liveStrokeFbo: スナップショットで初期化 (非消しゴムはここから rebuild で上書き)
-            val live = liveStrokeFbo ?: LayerFbo(w, h).also { liveStrokeFbo = it }
-            live.clear(); live.bind()
-            GLES20.glDisable(GLES20.GL_BLEND)
-            srcFbo?.let { drawTexFlat(normalComposite, it.texId, -1, 1f, w, h) }
-            GLES20.glEnable(GLES20.GL_BLEND)
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            if (isMixing) {
+                // ── ウェットキャンバス方式 (Fude / Watercolor / Blur) ──────────────
+                // layerFbo を wetCanvasFbo にコピーしてスタート。
+                // 以後のスタンプは直接 wetCanvasFbo へ書き込まれ、既存ピクセルと即座に混合。
+                // liveStrokeFbo を wetCanvasFbo と同一にして表示はそこから行う。
+                val wet = wetCanvasFbo ?: LayerFbo(w, h).also { wetCanvasFbo = it }
+                wet.clear(); wet.bind()
+                GLES20.glDisable(GLES20.GL_BLEND)
+                srcFbo?.let { drawTexFlat(normalComposite, it.texId, -1, 1f, w, h) }
+                GLES20.glEnable(GLES20.GL_BLEND)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                liveStrokeFbo = wet  // 表示は wetCanvasFbo をそのまま使用
 
-            if (!isEraser) {
-                // strokeSnapshotFbo: 読み取り専用コピー (rebuild の src)
-                val snap2 = strokeSnapshotFbo ?: LayerFbo(w, h).also { strokeSnapshotFbo = it }
-                snap2.clear(); snap2.bind()
+            } else {
+                // ── 通常方式 (Pencil / Marker / Airbrush / Eraser) ────────────────
+                // スナップショット + マーク蓄積 → rebuildLiveFromMarks でコンポジット
+                val live = liveStrokeFbo ?: LayerFbo(w, h).also { liveStrokeFbo = it }
+                live.clear(); live.bind()
                 GLES20.glDisable(GLES20.GL_BLEND)
                 srcFbo?.let { drawTexFlat(normalComposite, it.texId, -1, 1f, w, h) }
                 GLES20.glEnable(GLES20.GL_BLEND)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
 
-                // strokeMarksFbo: 空でリセット
-                val marks = strokeMarksFbo ?: LayerFbo(w, h).also { strokeMarksFbo = it }
-                marks.clear()
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                if (!isEraser) {
+                    val snap2 = strokeSnapshotFbo ?: LayerFbo(w, h).also { strokeSnapshotFbo = it }
+                    snap2.clear(); snap2.bind()
+                    GLES20.glDisable(GLES20.GL_BLEND)
+                    srcFbo?.let { drawTexFlat(normalComposite, it.texId, -1, 1f, w, h) }
+                    GLES20.glEnable(GLES20.GL_BLEND)
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+
+                    val marks = strokeMarksFbo ?: LayerFbo(w, h).also { strokeMarksFbo = it }
+                    marks.clear()
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                }
             }
 
             liveStrokeActiveLayerId = layerId
             lastLivePointCount      = 0
             liveDistToNextStamp     = 0f
             liveIsEraser            = isEraser
+            liveIsMixing            = isMixing
         }
 
         if (newCount >= 2 && newCount > lastLivePointCount) {
             val stroke = Stroke(livePts, brush, snap.currentColor, layerId)
 
-            if (isEraser) {
-                // 消しゴム: 直接 liveStrokeFbo へ destination-out
-                liveStrokeFbo!!.bind()
-                liveDistToNextStamp = brushRenderer.renderStrokeSegments(
-                    stroke          = stroke,
-                    fromPointIdx    = lastLivePointCount,
-                    distToNextStamp = liveDistToNextStamp,
-                )
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-            } else {
-                // 非消しゴム: marks に追加 → liveStrokeFbo を rebuild
-                strokeMarksFbo!!.bind()
-                liveDistToNextStamp = brushRenderer.renderStrokeSegments(
-                    stroke          = stroke,
-                    fromPointIdx    = lastLivePointCount,
-                    distToNextStamp = liveDistToNextStamp,
-                )
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                rebuildLiveFromMarks(brush, w, h)
+            when {
+                isMixing -> {
+                    // ウェットキャンバスへ直接書き込み。
+                    // Fude/Watercolor はスタンプ色 (CPU 混色済み) を SrcOver でブレンド。
+                    // Blur / ぼかし筆圧モードは 2 パス (dest-out + additive) でぼかしを適用。
+                    // いずれも wetCanvasFbo の既存ピクセルと即座に混合される。
+                    wetCanvasFbo!!.bind()
+                    liveDistToNextStamp = brushRenderer.renderStrokeSegments(
+                        stroke          = stroke,
+                        fromPointIdx    = lastLivePointCount,
+                        distToNextStamp = liveDistToNextStamp,
+                    )
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                }
+                isEraser -> {
+                    liveStrokeFbo!!.bind()
+                    liveDistToNextStamp = brushRenderer.renderStrokeSegments(
+                        stroke          = stroke,
+                        fromPointIdx    = lastLivePointCount,
+                        distToNextStamp = liveDistToNextStamp,
+                    )
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                }
+                else -> {
+                    // 通常ブラシ: marks に蓄積 → liveStrokeFbo を再コンポジット
+                    strokeMarksFbo!!.bind()
+                    liveDistToNextStamp = brushRenderer.renderStrokeSegments(
+                        stroke          = stroke,
+                        fromPointIdx    = lastLivePointCount,
+                        distToNextStamp = liveDistToNextStamp,
+                    )
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    rebuildLiveFromMarks(brush, w, h)
+                }
             }
 
             lastLivePointCount = newCount
@@ -314,19 +389,26 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         GLES20.glDisable(GLES20.GL_BLEND)
         drawTexFlat(normalComposite, snapshot.texId, -1, 1f, w, h)
 
-        // Step2: marks を opacity でブレンド (プリマルチプライドアルファ)
+        // Step2: marks をブレンド (プリマルチプライドアルファ)
+        // 筆・水彩筆・エアブラシ・Blur・Marker は compositeAlpha = 1.0 でキャップなし。
+        // Marker は GL_MAX で既存レイヤーのアルファを優先するため、opacity キャップ不要。
+        // Pencil のみ opacity でキャップを適用。
+        val compositeAlpha = when (brush.type) {
+            BrushType.Pencil -> brush.opacity
+            else -> 1.0f
+        }
         GLES20.glEnable(GLES20.GL_BLEND)
         if (brush.type == BrushType.Marker) {
             GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
             GLES30.glBlendEquationSeparate(GLES30.GL_FUNC_ADD, GLES30.GL_MAX)
-            drawTexFlat(normalComposite, marks.texId, -1, brush.opacity, w, h)
+            drawTexFlat(normalComposite, marks.texId, -1, compositeAlpha, w, h)
             GLES30.glBlendEquationSeparate(GLES30.GL_FUNC_ADD, GLES30.GL_FUNC_ADD)
         } else {
             GLES20.glBlendFuncSeparate(
                 GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
                 GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
             )
-            drawTexFlat(normalComposite, marks.texId, -1, brush.opacity, w, h)
+            drawTexFlat(normalComposite, marks.texId, -1, compositeAlpha, w, h)
         }
         GLES20.glBlendFuncSeparate(
             GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
@@ -361,6 +443,8 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
                             liveStrokeFbo = old
                             layerStrokeCounts[layer.id] = count
                             liveStrokeActiveLayerId = null
+                            // ウェットキャンバスは layerFbos にスワップ済み。参照を解除する。
+                            if (liveIsMixing) { wetCanvasFbo = null; liveIsMixing = false }
                         } else {
                             bakeStrokes(layer, cached, count, w, h)
                         }
@@ -423,20 +507,26 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         brushRenderer.renderStroke(stroke)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
 
-        // layerFbo へ opacity でプリマルチプライド SrcOver (Marker は alpha に GL_MAX)
+        // layerFbo へ合成アルファで SrcOver (Marker は alpha に GL_MAX)
+        // Marker は GL_MAX で既存レイヤーのアルファを優先するため compositeAlpha = 1.0。
+        // Pencil のみ opacity でキャップを適用。
+        val compositeAlpha = when (stroke.brush.type) {
+            BrushType.Pencil -> stroke.brush.opacity
+            else -> 1.0f
+        }
         layerFbo.bind()
         GLES20.glEnable(GLES20.GL_BLEND)
         if (stroke.brush.type == BrushType.Marker) {
             GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
             GLES30.glBlendEquationSeparate(GLES30.GL_FUNC_ADD, GLES30.GL_MAX)
-            drawTexFlat(normalComposite, marks.texId, -1, stroke.brush.opacity, w, h)
+            drawTexFlat(normalComposite, marks.texId, -1, compositeAlpha, w, h)
             GLES30.glBlendEquationSeparate(GLES30.GL_FUNC_ADD, GLES30.GL_FUNC_ADD)
         } else {
             GLES20.glBlendFuncSeparate(
                 GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
                 GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
             )
-            drawTexFlat(normalComposite, marks.texId, -1, stroke.brush.opacity, w, h)
+            drawTexFlat(normalComposite, marks.texId, -1, compositeAlpha, w, h)
         }
         GLES20.glBlendFuncSeparate(
             GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
@@ -470,7 +560,11 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         }
 
-        val hasLive = liveStrokeFbo != null && liveStrokeActiveLayerId == snap.activeLayerId
+        // Fix: liveStrokeFbo が有効かつアクティブレイヤーかつポイントが存在する場合のみ使用
+        val hasLive = liveStrokeFbo != null &&
+                      liveStrokeActiveLayerId == snap.activeLayerId &&
+                      snap.currentPoints.isNotEmpty()
+
         for (layer in snap.layers) {
             if (!layer.isVisible) continue
 
@@ -635,7 +729,13 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
     // ── 水彩キャプチャ ───────────────────────────────────────────────────
 
     fun captureLayerPixels(layerId: String, callback: (ByteArray, Int, Int) -> Unit) {
-        val fbo = layerFbos[layerId] ?: return
+        // ウェットキャンバスがアクティブな場合はそこからキャプチャする。
+        // これにより CPU 側 canvasMix() がストローク中の最新描画状態を参照でき、
+        // 自分のストロークとの真の混色が実現する。
+        val fbo = if (layerId == liveStrokeActiveLayerId && liveIsMixing && wetCanvasFbo != null)
+            wetCanvasFbo!!
+        else
+            layerFbos[layerId] ?: return
         val w = surfaceWidth; val h = surfaceHeight
         fbo.bind()
         val bb = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
@@ -648,6 +748,34 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
 
     fun requestWatercolorCapture(layerId: String, cb: (ByteArray, Int, Int) -> Unit) {
         watercolorCaptureRequest.set(Pair(layerId, cb))
+    }
+
+    // ── コンポジットキャプチャ (スポイト用) ─────────────────────────────
+
+    fun captureCompositePixels(callback: (ByteArray, Int, Int) -> Unit) {
+        val cache = compositeCache ?: return
+        val w = surfaceWidth; val h = surfaceHeight
+        if (w == 0 || h == 0) return
+        cache.bind()
+        val bb = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        bb.position(0)
+        val bytes = ByteArray(w * h * 4); bb.get(bytes)
+        callback(bytes, w, h)
+    }
+
+    fun requestCompositeCapture(cb: (ByteArray, Int, Int) -> Unit) {
+        compositeCaptureRequest.set(cb)
+    }
+
+    // ── 全レイヤーキャプチャ (PSD エクスポート用) ────────────────────────
+
+    fun requestAllLayersCapture(
+        layerIds: List<String>,
+        cb: (List<Pair<String, ByteArray>>, Int, Int) -> Unit,
+    ) {
+        allLayersCaptureRequest.set(AllLayersCaptureReq(layerIds, cb))
     }
 
     // ── ユーティリティ ───────────────────────────────────────────────────
@@ -679,6 +807,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         strokeSnapshotFbo?.delete()
         strokeMarksFbo?.delete()
         liveStrokeFbo?.delete()
+        wetCanvasFbo?.delete()
         bakingMarksFbo?.delete()
         compositeCache?.delete()
         compA?.delete(); compB?.delete()

@@ -21,6 +21,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.propaint.app.model.BrushType
 import com.propaint.app.viewmodel.PaintViewModel
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 @Composable
 fun BrushPanel(
@@ -58,17 +60,15 @@ fun BrushPanel(
             )
             Spacer(Modifier.height(12.dp))
 
-            // ── サイズ (全ブラシ) ───────────────────────────────────────
-            LabeledSlider(
-                label    = "サイズ",
-                value    = b.size,
-                range    = 1f..200f,
-                display  = "${b.size.toInt()}px",
+            // ── サイズ (非線形スケール) ─────────────────────────────────
+            SizeSlider(
+                size          = b.size,
                 onValueChange = { vm.setBrushSize(it) },
             )
 
-            // ── 不透明度 (消しゴム・Blur 以外) ─────────────────────────
-            if (b.type != BrushType.Eraser && b.type != BrushType.Blur) {
+            // ── 不透明度 (Pencil・Marker のみ) ─────────────────────────
+            val showOpacity = b.type == BrushType.Pencil || b.type == BrushType.Marker
+            if (showOpacity) {
                 LabeledSlider(
                     label    = "不透明度",
                     value    = b.opacity,
@@ -78,12 +78,9 @@ fun BrushPanel(
                 )
             }
 
-            // ── 濃度 / 混色率 / 流量 (Eraser・Blur 以外) ──────────────
-            val densityLabel = when (b.type) {
-                BrushType.Fude, BrushType.Watercolor, BrushType.Marker -> "混色率"
-                BrushType.Airbrush -> "流量"
-                else -> "濃度"
-            }
+            // ── 濃度 / 混色率 (Eraser・Blur 以外) ─────────────────────
+            // 筆・水彩筆・エアブラシは「濃度」、マーカーは「混色率」
+            val densityLabel = if (b.type == BrushType.Marker) "混色率" else "濃度"
             if (b.type != BrushType.Eraser && b.type != BrushType.Blur) {
                 LabeledSlider(
                     label    = densityLabel,
@@ -105,8 +102,9 @@ fun BrushPanel(
                 )
             }
 
-            // ── ハードネス (Pencil・Marker・Eraser) ─────────────────────
-            if (b.type == BrushType.Pencil || b.type == BrushType.Marker || b.type == BrushType.Eraser) {
+            // ── ハードネス (Pencil・Marker・Eraser・Fude・Watercolor・Airbrush) ──
+            val showHardness = b.type != BrushType.Blur
+            if (showHardness) {
                 LabeledSlider(
                     label    = "ハードネス",
                     value    = b.hardness,
@@ -115,6 +113,51 @@ fun BrushPanel(
                     onValueChange = { vm.setBrushHardness(it) },
                 )
             }
+
+            // ── アンチエイリアス (全ブラシ) ────────────────────────────────────
+            LabeledSlider(
+                label    = "アンチエイリアス",
+                value    = b.antiAliasing,
+                range    = 0f..4f,
+                display  = if (b.antiAliasing < 0.05f) "OFF"
+                           else "${"%.1f".format(b.antiAliasing)}px",
+                onValueChange = { vm.setBrushAntiAliasing(it) },
+            )
+
+            // ── 水分量 (Fude / Watercolor のみ) ────────────────────────
+            val showWaterContent = b.type == BrushType.Fude || b.type == BrushType.Watercolor
+            if (showWaterContent) {
+                LabeledSlider(
+                    label    = "水分量",
+                    value    = b.waterContent,
+                    range    = 0f..1f,
+                    display  = "${(b.waterContent * 100).toInt()}%",
+                    onValueChange = { vm.setBrushWaterContent(it) },
+                )
+            }
+
+            // ── 色伸び (Fude / Watercolor / Marker のみ) ───────────────
+            val showColorStretch = b.type == BrushType.Fude ||
+                                   b.type == BrushType.Watercolor ||
+                                   b.type == BrushType.Marker
+            if (showColorStretch) {
+                LabeledSlider(
+                    label    = "色伸び",
+                    value    = b.colorStretch,
+                    range    = 0f..1f,
+                    display  = "${(b.colorStretch * 100).toInt()}",
+                    onValueChange = { vm.setBrushColorStretch(it) },
+                )
+            }
+
+            // ── 間隔 (全ブラシ) ────────────────────────────────────────
+            LabeledSlider(
+                label    = "間隔",
+                value    = b.spacing,
+                range    = 0.01f..2.0f,
+                display  = "${(b.spacing * 100).toInt()}%",
+                onValueChange = { vm.setBrushSpacing(it) },
+            )
 
             // ── スタビライザー (全ブラシ) ──────────────────────────────
             LabeledSlider(
@@ -162,21 +205,111 @@ fun BrushPanel(
                         display  = "${(b.minSizeRatio * 100).toInt()}%",
                         onValueChange = { vm.setBrush(b.copy(minSizeRatio = it)) },
                     )
+                    LabeledSlider(
+                        label    = "筆圧感度 (サイズ)",
+                        value    = b.pressureSizeIntensity.toFloat(),
+                        range    = 1f..200f,
+                        display  = "${b.pressureSizeIntensity}",
+                        onValueChange = { vm.setPressureSizeIntensity(it.roundToInt()) },
+                    )
                 }
 
                 if (b.type != BrushType.Blur) {
+                    val pressureLabel = when (b.type) {
+                        BrushType.Fude, BrushType.Watercolor, BrushType.Airbrush -> "筆圧 → 濃度"
+                        else -> "筆圧 → 不透明度"
+                    }
                     Spacer(Modifier.height(4.dp))
                     PressureToggleCard(
-                        label    = "筆圧 → 不透明度",
+                        label    = pressureLabel,
                         subtitle = "強く押すと濃く描ける",
                         checked  = b.pressureOpacityEnabled,
                         onToggle = { vm.togglePressureOpacity() },
+                    )
+                    if (b.pressureOpacityEnabled) {
+                        LabeledSlider(
+                            label    = "筆圧感度 (不透明度)",
+                            value    = b.pressureOpacityIntensity.toFloat(),
+                            range    = 1f..200f,
+                            display  = "${b.pressureOpacityIntensity}",
+                            onValueChange = { vm.setPressureOpacityIntensity(it.roundToInt()) },
+                        )
+                    }
+                }
+
+                // ── 筆圧 → 混色 (Fude / Watercolor のみ) ──────────────
+                if (b.type == BrushType.Fude || b.type == BrushType.Watercolor) {
+                    Spacer(Modifier.height(4.dp))
+                    PressureToggleCard(
+                        label    = "筆圧 → 混色",
+                        subtitle = "強く押すと混色が強くなる",
+                        checked  = b.pressureMixEnabled,
+                        onToggle = { vm.togglePressureMix() },
+                    )
+                    if (b.pressureMixEnabled) {
+                        LabeledSlider(
+                            label    = "筆圧感度 (混色)",
+                            value    = b.pressureMixIntensity.toFloat(),
+                            range    = 1f..200f,
+                            display  = "${b.pressureMixIntensity}",
+                            onValueChange = { vm.setPressureMixIntensity(it.roundToInt()) },
+                        )
+                    }
+                }
+
+                // ── ぼかし筆圧 (Fude・Watercolor のみ) ─────────────────
+                if (b.type == BrushType.Fude || b.type == BrushType.Watercolor) {
+                    Spacer(Modifier.height(4.dp))
+                    LabeledSlider(
+                        label    = "ぼかし筆圧",
+                        value    = b.blurPressureThreshold,
+                        range    = 0f..1f,
+                        display  = if (b.blurPressureThreshold < 0.01f) "OFF"
+                                   else "${(b.blurPressureThreshold * 100).toInt()}%",
+                        onValueChange = { vm.setBrush(b.copy(blurPressureThreshold = it.coerceIn(0f, 1f))) },
                     )
                 }
             }
 
             Spacer(Modifier.height(16.dp))
         }
+    }
+}
+
+/**
+ * 非線形サイズスライダー (sqrt スケール)。
+ * 視覚的フラクション = sqrt((size-1)/1999)
+ * 実際サイズ = fraction^2 * 1999 + 1
+ */
+@Composable
+fun SizeSlider(
+    size: Float,
+    onValueChange: (Float) -> Unit,
+) {
+    val visualFraction = sqrt((size - 1f) / 1999f).coerceIn(0f, 1f)
+
+    Column(modifier = Modifier.padding(vertical = 4.dp)) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("サイズ", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+            Text("${size.toInt()}px", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
+        }
+        Slider(
+            value         = visualFraction,
+            onValueChange = { frac ->
+                val actualSize = (frac * frac * 1999f + 1f).coerceIn(1f, 2000f)
+                onValueChange(actualSize)
+            },
+            valueRange    = 0f..1f,
+            colors        = SliderDefaults.colors(
+                thumbColor          = Color.White,
+                activeTrackColor    = Color(0xFF4A90D9),
+                inactiveTrackColor  = Color(0xFF333333),
+            ),
+            modifier = Modifier.height(28.dp),
+        )
     }
 }
 

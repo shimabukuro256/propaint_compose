@@ -11,24 +11,35 @@ enum class BrushType(
     val displayName: String,
     val defaultSize: Float,
     val defaultOpacity: Float,
-    val defaultDensity: Float,   // Pencil:濃度 / Fude&Watercolor:混色率 / Airbrush:流量 / Marker:無視
+    val defaultDensity: Float,
     val defaultSpacing: Float,
     val defaultStabilizer: Float,
     val defaultHardness: Float,
+    /** 水分量デフォルト値。Fude / Watercolor のみ有効 (0=ドライ, 1=びしょびしょ)。 */
+    val defaultWaterContent: Float,
 ) {
-    Pencil("鉛筆",         4f,  0.9f, 0.80f, 0.06f, 0.3f, 0.95f),
-    Fude("筆",            10f,  0.8f, 0.50f, 0.12f, 0.5f, 0.40f),
-    Watercolor("水彩筆",   14f,  0.7f, 0.40f, 0.15f, 0.6f, 0.20f),
-    Airbrush("エアブラシ", 22f,  0.6f, 0.07f, 0.25f, 0.7f, 0.00f),
-    Marker("マーカー",     12f,  0.9f, 1.00f, 0.07f, 0.5f, 1.00f),
-    Eraser("消しゴム",     20f,  1.0f, 1.00f, 0.05f, 0.4f, 0.80f),
-    Blur("ぼかし",         14f,  0.7f, 0.50f, 0.15f, 0.5f, 0.30f),
+    Pencil("鉛筆",         4f,  0.9f, 0.80f, 0.06f, 0.3f, 0.95f, 0f),
+    Fude("筆",            10f,  0.8f, 0.70f, 0.01f, 0.5f, 1.00f, 0.5f),
+    Watercolor("水彩筆",   14f,  0.7f, 1.00f, 0.01f, 0.6f, 1.00f, 0.7f),
+    Airbrush("エアブラシ", 22f,  0.6f, 0.07f, 0.25f, 0.7f, 0.00f, 0f),
+    Marker("マーカー",     12f,  0.9f, 1.00f, 0.07f, 0.5f, 1.00f, 0f),
+    Eraser("消しゴム",     20f,  1.0f, 1.00f, 0.05f, 0.4f, 0.80f, 0f),
+    Blur("ぼかし",         14f,  0.7f, 0.50f, 0.15f, 0.5f, 1.00f, 0f),
 }
 
 /** ブラシの種類別カテゴリ判定 */
 val BrushType.needsCanvasCapture: Boolean get() =
     this == BrushType.Fude || this == BrushType.Watercolor ||
     this == BrushType.Marker || this == BrushType.Blur
+
+/**
+ * ウェットキャンバス方式が必要なブラシ。
+ * これらのブラシはスタンプを strokeMarksFbo に蓄積せず、layerFbo のコピー (wetCanvasFbo) に
+ * 直接書き込む。ストローク中に wetCanvasFbo を再キャプチャして CPU 側混色も更新するため、
+ * 自分の以前のストロークと真に混合できる。
+ */
+val BrushType.needsWetCanvas: Boolean get() =
+    this == BrushType.Fude || this == BrushType.Watercolor || this == BrushType.Blur
 
 data class BrushSettings(
     val type: BrushType = BrushType.Pencil,
@@ -40,9 +51,39 @@ data class BrushSettings(
     val stabilizer: Float = type.defaultStabilizer,
     /** Blur ツール専用: ボックスブラーの半径倍率 (0=最小, 1=最大) */
     val blurStrength: Float = 0.5f,
+    /**
+     * 色伸び: 前スタンプの色を次スタンプへ引きずる量 (0=引きずりなし, 1=最大)。
+     * Fude / Watercolor / Marker で有効。
+     */
+    val colorStretch: Float = 0.5f,
     val pressureSizeEnabled: Boolean = true,
     val pressureOpacityEnabled: Boolean = false,
     val minSizeRatio: Float = 0.2f,
+    /**
+     * ぼかし筆圧しきい値 (Fude / Watercolor 専用)。
+     * この値より低い筆圧では描画色を加えず混色のみ行う (0=無効)。
+     */
+    val blurPressureThreshold: Float = 0f,
+    /**
+     * 水分量 (Fude / Watercolor 専用, 0=ドライ, 1=びしょびしょ)。
+     * - 高いほどキャンバス色吸収が増加し、描画色が薄まる。
+     * - 低筆圧との組み合わせで自動的にぼかし挙動に近づく。
+     */
+    val waterContent: Float = type.defaultWaterContent,
+    /**
+     * アンチエイリアス強度 (0=なし, 1=1px フェード, 2=2px フェード …)。
+     * シェーダー内でスクリーン微分 (dFdx/dFdy) を使い、ブラシサイズに依らず
+     * 常に N ピクセル幅のエッジフェードを生成する。
+     */
+    val antiAliasing: Float = 1.0f,
+    /** 筆圧 → サイズ の感度 (1..200, デフォルト 100) */
+    val pressureSizeIntensity: Int = 100,
+    /** 筆圧 → 不透明度 の感度 (1..200, デフォルト 100) */
+    val pressureOpacityIntensity: Int = 100,
+    /** 筆圧 → 混色 の有効フラグ (Fude / Watercolor 専用) */
+    val pressureMixEnabled: Boolean = false,
+    /** 筆圧 → 混色 の感度 (1..200, デフォルト 100) */
+    val pressureMixIntensity: Int = 100,
 )
 
 // ── Stroke ──
@@ -85,6 +126,7 @@ data class PaintLayer(
     val opacity: Float = 1f,
     val blendMode: LayerBlendMode = LayerBlendMode.Normal,
     val strokes: List<Stroke> = emptyList(),
+    val isClippingMask: Boolean = false,
 )
 
 // ── Canvas action for undo/redo ──

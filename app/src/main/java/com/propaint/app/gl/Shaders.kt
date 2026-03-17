@@ -30,37 +30,55 @@ void main() {
 }"""
 
     /**
-     * 通常スタンプ: 円形 softclip + hardness エッジ。
+     * 通常スタンプ: 円形 softclip + hardness エッジ + スクリーン座標 AA。
      * uHardness=1 → ハードエッジ円形, uHardness=0 → Gaussian 的ソフトエッジ。
+     * uAA=0 → AA なし, uAA=1 → 1px フェード (デフォルト), uAA=2 → 2px フェード。
+     * dFdx/dFdy でスタンプ半径に依らず常に N ピクセル幅の AA 帯域を生成する。
      */
     const val STAMP_FRAG = """
+#extension GL_OES_standard_derivatives : enable
 precision mediump float;
 uniform float uHardness;
+uniform float uAA;
 varying vec2 vUV;
 varying float vAlpha;
 varying vec4 vColor;
 void main() {
     float d = length(vUV - 0.5);
-    if (d > 0.5) discard;
-    float edge = 1.0 - smoothstep(0.5 * uHardness, 0.5, d);
+    float pw = length(vec2(dFdx(d), dFdy(d)));
+    float aaSpan = max(uAA * pw, 1e-5);
+    float outerR = 0.5 + aaSpan * 0.5;
+    float innerR = 0.5 - aaSpan * 0.5;
+    if (d > outerR) discard;
+    float hardEdge = 1.0 - smoothstep(0.5 * uHardness, 0.5, d);
+    float aaEdge   = 1.0 - smoothstep(innerR, outerR, d);
+    float edge = min(hardEdge, aaEdge);
     float a = vAlpha * edge;
     gl_FragColor = vec4(vColor.rgb * a, a);
 }"""
 
     /**
-     * 消しゴムスタンプ: 円形 softclip + hardness エッジ。
+     * 消しゴムスタンプ: 円形 softclip + hardness エッジ + スクリーン座標 AA。
      * Destination-out ブレンドと組み合わせて使用。
      * glBlendFuncSeparate(ZERO, ONE_MINUS_SRC_ALPHA, ZERO, ONE_MINUS_SRC_ALPHA) が必要。
      */
     const val ERASER_STAMP_FRAG = """
+#extension GL_OES_standard_derivatives : enable
 precision mediump float;
 uniform float uHardness;
+uniform float uAA;
 varying vec2 vUV;
 varying float vAlpha;
 void main() {
     float d = length(vUV - 0.5);
-    if (d > 0.5) discard;
-    float edge = 1.0 - smoothstep(0.5 * uHardness, 0.5, d);
+    float pw = length(vec2(dFdx(d), dFdy(d)));
+    float aaSpan = max(uAA * pw, 1e-5);
+    float outerR = 0.5 + aaSpan * 0.5;
+    float innerR = 0.5 - aaSpan * 0.5;
+    if (d > outerR) discard;
+    float hardEdge = 1.0 - smoothstep(0.5 * uHardness, 0.5, d);
+    float aaEdge   = 1.0 - smoothstep(innerR, outerR, d);
+    float edge = min(hardEdge, aaEdge);
     gl_FragColor = vec4(0.0, 0.0, 0.0, vAlpha * edge);
 }"""
 

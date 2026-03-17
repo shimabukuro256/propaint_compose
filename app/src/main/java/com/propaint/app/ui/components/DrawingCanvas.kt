@@ -1,5 +1,6 @@
 package com.propaint.app.ui.components
 
+import android.os.Environment
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
@@ -14,7 +15,11 @@ import com.propaint.app.gl.GlCanvasView
 import com.propaint.app.gl.RenderSnapshot
 import com.propaint.app.model.BrushType
 import com.propaint.app.model.needsCanvasCapture
+import com.propaint.app.model.needsWetCanvas
 import com.propaint.app.viewmodel.PaintViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.sin
@@ -76,6 +81,12 @@ fun DrawingCanvas(
                 }
                 .pointerInput(Unit) {
                     awaitPointerEventScope {
+                        // マルチフィンガータップ状態管理 (2/3指タップでundo/redo)
+                        var multiTapFingerCount = 0
+                        var multiTapStartTime   = 0L
+                        var multiTapMaxMoved    = 0f
+                        var multiTapActive      = false
+
                         while (true) {
                             val event   = awaitPointerEvent()
                             val changes = event.changes
@@ -106,6 +117,12 @@ fun DrawingCanvas(
                                             for (h in change.historical)
                                                 viewModel.addStrokePoint(screenToCanvas(h.position), pressure)
                                             viewModel.addStrokePoint(pos, pressure)
+                                            // ウェットキャンバス系ブラシ: フレームごとにキャンバス状態を再取得。
+                                            // AtomicReference により GL スレッドは最大 1 フレームに 1 回処理するため
+                                            // ここで毎ポイント要求しても glReadPixels は throttle される。
+                                            if (viewModel.brushSettings.type.needsWetCanvas) {
+                                                requestCapture(viewModel.activeLayerId)
+                                            }
                                             change.consume()
                                         }
                                         change.changedToUp() -> {
@@ -119,71 +136,124 @@ fun DrawingCanvas(
                                     }
                                 }
 
-                                // ── 2 本指: ピンチ / パン / 回転 ──────────────
+                                // ── 2本指以上: タップ判定 + ピンチ / パン / 回転 ──
                                 changes.size >= 2 -> {
                                     if (isPointerDrawing) {
                                         viewModel.endStroke()
                                         viewModel.clearPixelCapture()
                                         isPointerDrawing = false
                                     }
-                                    val p0 = changes[0]; val p1 = changes[1]
-                                    val curDist  = dist(p0.position, p1.position)
-                                    val prevDist = dist(p0.previousPosition, p1.previousPosition)
-                                    val curCenter  = (p0.position + p1.position) / 2f
-                                    val prevCenter = (p0.previousPosition + p1.previousPosition) / 2f
 
-                                    val cx = canvasWidth / 2f; val cy = canvasHeight / 2f
-                                    val oldZoom = viewModel.zoom
-                                    val oldPan  = viewModel.panOffset
-                                    val oldRot  = viewModel.rotation
-
-                                    val newZoom = if (prevDist > 10f)
-                                        (oldZoom * (curDist / prevDist)).coerceIn(0.1f, 10f)
-                                    else oldZoom
-
-                                    val curVec  = p1.position - p0.position
-                                    val prevVec = p1.previousPosition - p0.previousPosition
-                                    val rawDA = if (prevDist > 10f)
-                                        (atan2(curVec.y.toDouble(), curVec.x.toDouble()) -
-                                         atan2(prevVec.y.toDouble(), prevVec.x.toDouble())).toFloat()
-                                    else 0f
-                                    val dAngle = when {
-                                        rawDA >  Math.PI.toFloat() -> rawDA - 2f * Math.PI.toFloat()
-                                        rawDA < -Math.PI.toFloat() -> rawDA + 2f * Math.PI.toFloat()
-                                        else -> rawDA
+                                    // マルチフィンガータップ検出
+                                    if (!multiTapActive && changes.any { it.changedToDown() }) {
+                                        multiTapActive      = true
+                                        multiTapFingerCount = changes.size
+                                        multiTapStartTime   = System.currentTimeMillis()
+                                        multiTapMaxMoved    = 0f
                                     }
-                                    val newRot = oldRot + dAngle
+                                    if (multiTapActive) {
+                                        changes.forEach { c ->
+                                            val moved = (c.position - c.previousPosition).getDistance()
+                                            if (moved > multiTapMaxMoved) multiTapMaxMoved = moved
+                                        }
+                                    }
+                                    if (multiTapActive && changes.all { it.changedToUp() }) {
+                                        val elapsed = System.currentTimeMillis() - multiTapStartTime
+                                        if (elapsed < 300 && multiTapMaxMoved < 20f) {
+                                            // タップ確定
+                                            when (multiTapFingerCount) {
+                                                2 -> viewModel.undo()
+                                                3 -> viewModel.redo()
+                                            }
+                                            changes.forEach { it.consume() }
+                                        }
+                                        multiTapActive = false
+                                    }
 
-                                    val k    = newZoom / oldZoom
-                                    val dvx  = prevCenter.x - cx - oldPan.x
-                                    val dvy  = prevCenter.y - cy - oldPan.y
-                                    val cosDA = cos(dAngle.toDouble()).toFloat()
-                                    val sinDA = sin(dAngle.toDouble()).toFloat()
-                                    val newPanX = curCenter.x - cx - k * (cosDA * dvx - sinDA * dvy)
-                                    val newPanY = curCenter.y - cy - k * (sinDA * dvx + cosDA * dvy)
+                                    // タップ中でなければピンチ/パン/回転処理
+                                    if (!multiTapActive || changes.none { it.changedToUp() }) {
+                                        val p0 = changes[0]; val p1 = changes[1]
+                                        val curDist  = dist(p0.position, p1.position)
+                                        val prevDist = dist(p0.previousPosition, p1.previousPosition)
+                                        val curCenter  = (p0.position + p1.position) / 2f
+                                        val prevCenter = (p0.previousPosition + p1.previousPosition) / 2f
 
-                                    viewModel.updateViewTransform(newZoom, Offset(newPanX, newPanY), newRot)
-                                    glView.submitTransformFast(newZoom, newPanX, newPanY, newRot)
-                                    changes.forEach { it.consume() }
+                                        val cx = canvasWidth / 2f; val cy = canvasHeight / 2f
+                                        val oldZoom = viewModel.zoom
+                                        val oldPan  = viewModel.panOffset
+                                        val oldRot  = viewModel.rotation
+
+                                        val newZoom = if (prevDist > 10f)
+                                            (oldZoom * (curDist / prevDist)).coerceIn(0.1f, 10f)
+                                        else oldZoom
+
+                                        val curVec  = p1.position - p0.position
+                                        val prevVec = p1.previousPosition - p0.previousPosition
+                                        val rawDA = if (prevDist > 10f)
+                                            (atan2(curVec.y.toDouble(), curVec.x.toDouble()) -
+                                             atan2(prevVec.y.toDouble(), prevVec.x.toDouble())).toFloat()
+                                        else 0f
+                                        val dAngle = when {
+                                            rawDA >  Math.PI.toFloat() -> rawDA - 2f * Math.PI.toFloat()
+                                            rawDA < -Math.PI.toFloat() -> rawDA + 2f * Math.PI.toFloat()
+                                            else -> rawDA
+                                        }
+                                        val newRot = oldRot + dAngle
+
+                                        val k    = newZoom / oldZoom
+                                        val dvx  = prevCenter.x - cx - oldPan.x
+                                        val dvy  = prevCenter.y - cy - oldPan.y
+                                        val cosDA = cos(dAngle.toDouble()).toFloat()
+                                        val sinDA = sin(dAngle.toDouble()).toFloat()
+                                        val newPanX = curCenter.x - cx - k * (cosDA * dvx - sinDA * dvy)
+                                        val newPanY = curCenter.y - cy - k * (sinDA * dvx + cosDA * dvy)
+
+                                        viewModel.updateViewTransform(newZoom, Offset(newPanX, newPanY), newRot)
+                                        glView.submitTransformFast(newZoom, newPanX, newPanY, newRot)
+                                        changes.forEach { it.consume() }
+                                    }
                                 }
 
-                                // ── 1 本指: 描画 ─────────────────────────────
+                                // ── 1 本指: 描画 or スポイト ─────────────────────
                                 changes.size == 1 -> {
+                                    // タップが終わったらリセット
+                                    if (multiTapActive && changes.all { !it.pressed }) {
+                                        multiTapActive = false
+                                    }
+
                                     val change   = changes[0]
                                     val pressure = change.pressure.coerceIn(0f, 1f)
                                     val pos      = screenToCanvas(change.position)
 
                                     when {
                                         change.changedToDown() -> {
-                                            isPointerDrawing = true
-                                            requestCapture(viewModel.activeLayerId)
-                                            viewModel.startStroke(pos, pressure)
-                                            change.consume()
+                                            if (viewModel.isEyedropperActive) {
+                                                // スポイト: コンポジットをキャプチャして色を取得
+                                                val canvasPos = screenToCanvas(change.position)
+                                                glView.requestCompositeCapture { pixels, w, h ->
+                                                    viewModel.pickColorFromPixels(
+                                                        pixels,
+                                                        canvasPos.x.toInt(),
+                                                        canvasPos.y.toInt(),
+                                                        w, h,
+                                                    )
+                                                    viewModel.deactivateEyedropper()
+                                                }
+                                                change.consume()
+                                            } else {
+                                                isPointerDrawing = true
+                                                requestCapture(viewModel.activeLayerId)
+                                                viewModel.startStroke(pos, pressure)
+                                                change.consume()
+                                            }
                                         }
                                         change.pressed && isPointerDrawing -> {
                                             for (h in change.historical)
                                                 viewModel.addStrokePoint(screenToCanvas(h.position), pressure)
                                             viewModel.addStrokePoint(pos, pressure)
+                                            if (viewModel.brushSettings.type.needsWetCanvas) {
+                                                requestCapture(viewModel.activeLayerId)
+                                            }
                                             change.consume()
                                         }
                                         change.changedToUp() -> {
@@ -201,6 +271,29 @@ fun DrawingCanvas(
                     }
                 },
         )
+    }
+
+    // ── PSD export ──────────────────────────────────────────────────────────
+    val coroutineScope = rememberCoroutineScope()
+    LaunchedEffect(viewModel.psdExportRequested) {
+        if (!viewModel.psdExportRequested) return@LaunchedEffect
+        viewModel.clearPsdExportRequest()
+        val layerIds = viewModel.layers.map { it.id }
+        glView.requestAllLayersCapture(layerIds) { layerPixels, w, h ->
+            coroutineScope.launch {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val dir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                            ?: context.filesDir
+                        dir.mkdirs()
+                        val file = java.io.File(dir, "propaint_export_${System.currentTimeMillis()}.psd")
+                        file.outputStream().use { stream ->
+                            viewModel.exportPsdFromPixels(layerPixels, w, h, stream)
+                        }
+                    } catch (_: Exception) { /* silently ignore */ }
+                }
+            }
+        }
     }
 
     SideEffect {

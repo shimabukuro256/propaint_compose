@@ -29,9 +29,24 @@ fun PaintScreen(vm: PaintViewModel = viewModel()) {
         // ── 浮遊 TopBar (2 行) ───────────────────────────────────────────
         TopBar(
             vm            = vm,
-            onColorPicker = { showColor = !showColor;  showBrush = false; showLayers = false },
-            onLayerPanel  = { showLayers = !showLayers; showBrush = false; showColor = false },
-            onBrushPanel  = { showBrush = !showBrush;  showColor = false; showLayers = false },
+            onColorPicker = {
+                showColor = !showColor
+                showBrush = false
+                showLayers = false
+                if (vm.isEyedropperActive) vm.deactivateEyedropper()
+            },
+            onLayerPanel  = {
+                showLayers = !showLayers
+                showBrush = false
+                showColor = false
+                if (vm.isEyedropperActive) vm.deactivateEyedropper()
+            },
+            onBrushPanel  = {
+                showBrush = !showBrush
+                showColor = false
+                showLayers = false
+                if (vm.isEyedropperActive) vm.deactivateEyedropper()
+            },
             modifier      = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth(),
@@ -79,7 +94,11 @@ fun PaintScreen(vm: PaintViewModel = viewModel()) {
                 .align(Alignment.TopEnd)
                 .padding(top = TOP_BAR_HEIGHT),
         ) {
-            LayerPanel(vm = vm, onClose = { showLayers = false })
+            LayerPanel(
+                vm          = vm,
+                onClose     = { showLayers = false },
+                onExportPsd = { vm.requestPsdExport() },
+            )
         }
     }
 }

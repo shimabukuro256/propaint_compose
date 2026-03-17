@@ -38,7 +38,7 @@ val brushIcons: Map<BrushType, ImageVector> = mapOf(
 
 // ── TopBar (2 行) ────────────────────────────────────────────────────────
 //
-// 行 1: アプリ名 | Undo/Redo | ─── | Grid | Zoom% | Color | Layers
+// 行 1: アプリ名 | Undo/Redo | ─── | Grid | Zoom% | Color | スポイト | Layers
 // 行 2: [ブラシ種別スクロール] | ブラシ設定ボタン | 筆圧ボタン
 
 @Composable
@@ -100,6 +100,17 @@ fun TopBar(
             )
 
             Spacer(Modifier.width(4.dp))
+
+            // スポイト (スポットカラーピッカー)
+            ToolBtn(
+                icon       = Icons.Default.ColorLens,
+                label      = "スポイト",
+                isSelected = vm.isEyedropperActive,
+            ) {
+                if (vm.isEyedropperActive) vm.deactivateEyedropper()
+                else vm.activateEyedropper()
+            }
+
             ToolBtn(Icons.Default.Layers, "レイヤー") { onLayerPanel() }
         }
 

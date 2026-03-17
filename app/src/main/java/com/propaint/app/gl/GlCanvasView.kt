@@ -59,6 +59,35 @@ class GlCanvasView(context: Context) : GLSurfaceView(context) {
         requestRender()
     }
 
+    /**
+     * スポイト用: コンポジットキャンバスのピクセルを非同期でキャプチャし、
+     * [onReady] をメインスレッドで呼び出す。
+     *
+     * ピクセルデータは RGBA バイト列 (行優先, GL座標: y=0 が下端)。
+     */
+    fun requestCompositeCapture(
+        onReady: (pixels: ByteArray, width: Int, height: Int) -> Unit,
+    ) {
+        renderer.requestCompositeCapture { bytes, w, h ->
+            mainHandler.post { onReady(bytes, w, h) }
+        }
+        requestRender()
+    }
+
+    /**
+     * PSD エクスポート用: 指定レイヤーのピクセルを非同期でキャプチャし、
+     * [onReady] をメインスレッドで呼び出す。
+     */
+    fun requestAllLayersCapture(
+        layerIds: List<String>,
+        onReady: (List<Pair<String, ByteArray>>, Int, Int) -> Unit,
+    ) {
+        renderer.requestAllLayersCapture(layerIds) { list, w, h ->
+            mainHandler.post { onReady(list, w, h) }
+        }
+        requestRender()
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         queueEvent { renderer.cleanup() }

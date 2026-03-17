@@ -156,9 +156,15 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         out.writeFloat(bs.hardness)
         out.writeFloat(bs.stabilizer)
         out.writeFloat(bs.blurStrength)
+        out.writeFloat(bs.colorStretch)
+        out.writeFloat(bs.blurPressureThreshold)
         out.writeBoolean(bs.pressureSizeEnabled)
         out.writeBoolean(bs.pressureOpacityEnabled)
         out.writeFloat(bs.minSizeRatio)
+        out.writeInt(bs.pressureSizeIntensity)
+        out.writeInt(bs.pressureOpacityIntensity)
+        out.writeBoolean(bs.pressureMixEnabled)
+        out.writeInt(bs.pressureMixIntensity)
     }
 
     private fun readBrushSettings(inp: DataInputStream): BrushSettings {
@@ -172,21 +178,33 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         val hardness          = try { inp.readFloat() } catch (_: Exception) { type.defaultHardness }
         val stabilizer        = try { inp.readFloat() } catch (_: Exception) { type.defaultStabilizer }
         val blurStrength      = try { inp.readFloat() } catch (_: Exception) { 0.5f }
+        val colorStretch      = try { inp.readFloat() } catch (_: Exception) { 0.5f }
+        val blurPressureThreshold = try { inp.readFloat() } catch (_: Exception) { 0f }
         val presSize          = try { inp.readBoolean() } catch (_: Exception) { true }
         val presOpacity       = try { inp.readBoolean() } catch (_: Exception) { false }
         val minSizeRatio      = try { inp.readFloat() } catch (_: Exception) { 0.2f }
+        val pressureSizeIntensity    = try { inp.readInt() } catch (_: Exception) { 100 }
+        val pressureOpacityIntensity = try { inp.readInt() } catch (_: Exception) { 100 }
+        val pressureMixEnabled       = try { inp.readBoolean() } catch (_: Exception) { false }
+        val pressureMixIntensity     = try { inp.readInt() } catch (_: Exception) { 100 }
         return BrushSettings(
-            type                 = type,
-            size                 = size,
-            opacity              = opacity,
-            density              = density,
-            spacing              = spacing,
-            hardness             = hardness,
-            stabilizer           = stabilizer,
-            blurStrength         = blurStrength,
-            pressureSizeEnabled  = presSize,
-            pressureOpacityEnabled = presOpacity,
-            minSizeRatio         = minSizeRatio,
+            type                     = type,
+            size                     = size,
+            opacity                  = opacity,
+            density                  = density,
+            spacing                  = spacing,
+            hardness                 = hardness,
+            stabilizer               = stabilizer,
+            blurStrength             = blurStrength,
+            colorStretch             = colorStretch,
+            blurPressureThreshold    = blurPressureThreshold,
+            pressureSizeEnabled      = presSize,
+            pressureOpacityEnabled   = presOpacity,
+            minSizeRatio             = minSizeRatio,
+            pressureSizeIntensity    = pressureSizeIntensity,
+            pressureOpacityIntensity = pressureOpacityIntensity,
+            pressureMixEnabled       = pressureMixEnabled,
+            pressureMixIntensity     = pressureMixIntensity,
         )
     }
 
@@ -201,6 +219,7 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         out.writeInt(layer.blendMode.ordinal)
         out.writeInt(layer.strokes.size)
         layer.strokes.forEach { writeStroke(out, it) }
+        out.writeBoolean(layer.isClippingMask)
     }
 
     private fun readLayer(inp: DataInputStream): PaintLayer {
@@ -211,7 +230,8 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         val opacity   = inp.readFloat()
         val blendMode = LayerBlendMode.entries.getOrElse(inp.readInt()) { LayerBlendMode.Normal }
         val strokes   = List(inp.readInt()) { readStroke(inp) }
-        return PaintLayer(id, name, isVisible, isLocked, opacity, blendMode, strokes)
+        val isClippingMask = try { inp.readBoolean() } catch (_: Exception) { false }
+        return PaintLayer(id, name, isVisible, isLocked, opacity, blendMode, strokes, isClippingMask)
     }
 
     // ── Color ────────────────────────────────────────────────────────────────

@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.*
@@ -15,17 +17,25 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.propaint.app.model.LayerBlendMode
+import com.propaint.app.model.PaintLayer
 import com.propaint.app.viewmodel.PaintViewModel
 
 @Composable
 fun LayerPanel(
     vm: PaintViewModel,
     onClose: () -> Unit,
+    onExportPsd: (() -> Unit)? = null,
 ) {
+    var editingLayerId by remember { mutableStateOf<String?>(null) }
+
     Column(
         modifier = Modifier
             .width(260.dp)
@@ -42,18 +52,21 @@ fun LayerPanel(
             itemsIndexed(reversed, key = { _, l -> l.id }) { _, layer ->
                 val isActive = layer.id == vm.activeLayerId
                 LayerTile(
-                    name = layer.name,
-                    isActive = isActive,
-                    isVisible = layer.isVisible,
-                    isLocked = layer.isLocked,
-                    opacity = layer.opacity,
-                    blendMode = layer.blendMode,
-                    strokeCount = layer.strokes.size,
-                    onTap = { vm.selectLayer(layer.id) },
-                    onVisibility = { vm.toggleLayerVisibility(layer.id) },
-                    onLock = { vm.toggleLayerLock(layer.id) },
-                    onOpacity = { vm.setLayerOpacity(layer.id, it) },
-                    onBlendMode = { vm.setLayerBlendMode(layer.id, it) },
+                    layer         = layer,
+                    isActive      = isActive,
+                    isEditing     = editingLayerId == layer.id,
+                    onTap         = { vm.selectLayer(layer.id) },
+                    onStartEdit   = { editingLayerId = layer.id },
+                    onRename      = { newName ->
+                        vm.renameLayer(layer.id, newName)
+                        editingLayerId = null
+                    },
+                    onCancelEdit  = { editingLayerId = null },
+                    onVisibility  = { vm.toggleLayerVisibility(layer.id) },
+                    onLock        = { vm.toggleLayerLock(layer.id) },
+                    onOpacity     = { vm.setLayerOpacity(layer.id, it) },
+                    onBlendMode   = { vm.setLayerBlendMode(layer.id, it) },
+                    onClipMask    = { vm.toggleClippingMask(layer.id) },
                 )
             }
         }
@@ -73,25 +86,47 @@ fun LayerPanel(
                 enabled = vm.layers.size > 1,
             ) { vm.removeLayer(vm.activeLayerId) }
         }
+        if (onExportPsd != null) {
+            HorizontalDivider(color = Color(0xFF333333))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextButton(onClick = onExportPsd) {
+                    Text("PSD出力", fontSize = 12.sp, color = Color(0xFF4A90D9))
+                }
+            }
+        }
     }
 }
 
 @Composable
 private fun LayerTile(
-    name: String,
+    layer: PaintLayer,
     isActive: Boolean,
-    isVisible: Boolean,
-    isLocked: Boolean,
-    opacity: Float,
-    blendMode: LayerBlendMode,
-    strokeCount: Int,
+    isEditing: Boolean,
     onTap: () -> Unit,
+    onStartEdit: () -> Unit,
+    onRename: (String) -> Unit,
+    onCancelEdit: () -> Unit,
     onVisibility: () -> Unit,
     onLock: () -> Unit,
     onOpacity: (Float) -> Unit,
     onBlendMode: (LayerBlendMode) -> Unit,
+    onClipMask: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    var editText by remember(layer.name) { mutableStateOf(layer.name) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(isEditing) {
+        if (isEditing) {
+            editText = layer.name
+            focusRequester.requestFocus()
+            keyboard?.show()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -110,9 +145,9 @@ private fun LayerTile(
             // Visibility
             IconButton(onClick = onVisibility, modifier = Modifier.size(24.dp)) {
                 Icon(
-                    if (isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                    if (layer.isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
                     null,
-                    tint = if (isVisible) Color.White.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.24f),
+                    tint = if (layer.isVisible) Color.White.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.24f),
                     modifier = Modifier.size(16.dp),
                 )
             }
@@ -127,28 +162,67 @@ private fun LayerTile(
                     .border(1.dp, Color(0xFF444444), RoundedCornerShape(4.dp)),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("$strokeCount", color = Color.White.copy(alpha = 0.38f), fontSize = 10.sp)
+                Text("${layer.strokes.size}", color = Color.White.copy(alpha = 0.38f), fontSize = 10.sp)
             }
 
             Spacer(Modifier.width(8.dp))
 
             // Name and info
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    name,
-                    color = if (isActive) Color.White else Color.White.copy(alpha = 0.7f),
-                    fontSize = 13.sp,
-                    fontWeight = if (isActive) androidx.compose.ui.text.font.FontWeight.SemiBold
-                                 else androidx.compose.ui.text.font.FontWeight.Normal,
-                )
-                Text(
-                    "${blendMode.displayName} · ${(opacity * 100).toInt()}%",
-                    color = Color.White.copy(alpha = 0.38f),
-                    fontSize = 10.sp,
-                )
+                if (isEditing) {
+                    OutlinedTextField(
+                        value         = editText,
+                        onValueChange = { editText = it },
+                        modifier      = Modifier
+                            .fillMaxWidth()
+                            .height(36.dp)
+                            .focusRequester(focusRequester),
+                        singleLine    = true,
+                        textStyle     = LocalTextStyle.current.copy(
+                            color    = Color.White,
+                            fontSize = 12.sp,
+                        ),
+                        colors        = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor   = Color(0xFF4A90D9),
+                            unfocusedBorderColor = Color(0xFF555555),
+                            cursorColor          = Color.White,
+                        ),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(
+                            onDone = {
+                                keyboard?.hide()
+                                onRename(editText.ifBlank { layer.name })
+                            },
+                        ),
+                    )
+                } else {
+                    Text(
+                        layer.name,
+                        color = if (isActive) Color.White else Color.White.copy(alpha = 0.7f),
+                        fontSize = 13.sp,
+                        fontWeight = if (isActive) androidx.compose.ui.text.font.FontWeight.SemiBold
+                                     else androidx.compose.ui.text.font.FontWeight.Normal,
+                        modifier = Modifier.clickable(onClick = onStartEdit),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (layer.isClippingMask) {
+                            Text(
+                                "クリップ",
+                                color    = Color(0xFF4A90D9).copy(alpha = 0.7f),
+                                fontSize = 9.sp,
+                                modifier = Modifier.padding(end = 4.dp),
+                            )
+                        }
+                        Text(
+                            "${layer.blendMode.displayName} · ${(layer.opacity * 100).toInt()}%",
+                            color = Color.White.copy(alpha = 0.38f),
+                            fontSize = 10.sp,
+                        )
+                    }
+                }
             }
 
-            if (isLocked) {
+            if (layer.isLocked) {
                 Icon(Icons.Default.Lock, null, tint = Color.White.copy(alpha = 0.38f), modifier = Modifier.size(14.dp))
                 Spacer(Modifier.width(4.dp))
             }
@@ -168,7 +242,7 @@ private fun LayerTile(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("不透明度", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
                 Slider(
-                    value = opacity,
+                    value = layer.opacity,
                     onValueChange = onOpacity,
                     modifier = Modifier.weight(1f).height(24.dp),
                     colors = SliderDefaults.colors(
@@ -177,17 +251,17 @@ private fun LayerTile(
                         inactiveTrackColor = Color(0xFF333333),
                     ),
                 )
-                Text("${(opacity * 100).toInt()}%", color = Color.White.copy(alpha = 0.54f), fontSize = 10.sp,
+                Text("${(layer.opacity * 100).toInt()}%", color = Color.White.copy(alpha = 0.54f), fontSize = 10.sp,
                     modifier = Modifier.width(30.dp))
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("ブレンド", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
-                Spacer(Modifier.width(8.dp))
-                // Simplified: row of blend mode chips
+            // ブレンドモード: 全6種類を2行に分けて表示
+            Text("ブレンド", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
+            Spacer(Modifier.height(4.dp))
+            for (row in LayerBlendMode.entries.chunked(3)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    for (mode in LayerBlendMode.entries.take(4)) {
-                        val sel = mode == blendMode
+                    for (mode in row) {
+                        val sel = mode == layer.blendMode
                         Text(
                             mode.displayName,
                             fontSize = 10.sp,
@@ -200,12 +274,36 @@ private fun LayerTile(
                         )
                     }
                 }
+                Spacer(Modifier.height(4.dp))
+            }
+
+            // クリッピングマスク
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("クリッピング", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
+                Spacer(Modifier.weight(1f))
+                Switch(
+                    checked = layer.isClippingMask,
+                    onCheckedChange = { onClipMask() },
+                    modifier = Modifier.height(24.dp),
+                    colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF4A90D9)),
+                )
             }
 
             Spacer(Modifier.height(4.dp))
             Row {
                 TextButton(onClick = onLock, modifier = Modifier.height(28.dp)) {
-                    Text(if (isLocked) "解除" else "ロック", fontSize = 11.sp)
+                    Text(if (layer.isLocked) "解除" else "ロック", fontSize = 11.sp)
+                }
+                if (isEditing) {
+                    TextButton(
+                        onClick = onCancelEdit,
+                        modifier = Modifier.height(28.dp),
+                    ) {
+                        Text("キャンセル", fontSize = 11.sp, color = Color.White.copy(alpha = 0.5f))
+                    }
                 }
             }
         }
