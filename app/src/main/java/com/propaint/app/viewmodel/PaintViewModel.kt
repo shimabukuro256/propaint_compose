@@ -12,6 +12,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.lifecycle.AndroidViewModel
 import com.propaint.app.gl.PsdExporter
 import com.propaint.app.gl.PsdLayerData
+import com.propaint.app.io.CanvasData
 import com.propaint.app.model.*
 import java.io.File
 import java.io.OutputStream
@@ -54,8 +55,38 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
     var isEyedropperActive by mutableStateOf(false)
         private set
 
-    // ── PSD export request ──
-    var psdExportRequested by mutableStateOf(false)
+    // ── Canvas identity ──
+    var canvasId by mutableStateOf(java.util.UUID.randomUUID().toString())
+        private set
+    var canvasTitle by mutableStateOf("無題")
+        private set
+    var canvasDocWidth by mutableIntStateOf(0)
+        private set
+    var canvasDocHeight by mutableIntStateOf(0)
+        private set
+
+    // ── Export request ──
+    enum class ExportType { PNG, JPEG, WEBP, PSD, PPAINT }
+    var exportRequest: ExportType? by mutableStateOf(null)
+        private set
+
+    // ── Auto-save (ギャラリーへ戻る前にトリガー) ──
+    var saveCanvasRequest by mutableIntStateOf(0)
+        private set
+    fun requestSaveCanvas() { saveCanvasRequest++ }
+
+    // ── Layer pixel upload (for loading saved canvases) ──
+    var pendingPixelUploads: List<Pair<String, ByteArray>>? = null
+        private set
+    var pendingPixelWidth = 0
+        private set
+    var pendingPixelHeight = 0
+        private set
+    var pixelUploadVersion by mutableIntStateOf(0)
+        private set
+
+    // ── Filter preview ──
+    var filterPreview: LayerFilter? by mutableStateOf(null)
         private set
 
     // ── Canvas pixel capture (for Fude / Watercolor / Marker / Blur) ──
@@ -138,6 +169,7 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
     fun togglePressureMix() { setBrush(brushSettings.copy(pressureMixEnabled = !brushSettings.pressureMixEnabled)) }
     fun setPressureMixIntensity(v: Int) { setBrush(brushSettings.copy(pressureMixIntensity = v.coerceIn(1, 200))) }
     fun setBrushWaterContent(v: Float) { setBrush(brushSettings.copy(waterContent = v.coerceIn(0f, 1f))) }
+    fun setBrushWatercolorBlurStrength(v: Int) { setBrush(brushSettings.copy(watercolorBlurStrength = v.coerceIn(1, 100))) }
     fun setBrushAntiAliasing(v: Float) { setBrush(brushSettings.copy(antiAliasing = v.coerceIn(0f, 4f))) }
 
     // ── Color ──
@@ -155,8 +187,112 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
     fun activateEyedropper() { isEyedropperActive = true }
     fun deactivateEyedropper() { isEyedropperActive = false }
 
-    fun requestPsdExport() { psdExportRequested = true }
-    fun clearPsdExportRequest() { psdExportRequested = false }
+    fun requestExport(type: ExportType) { exportRequest = type }
+    fun clearExportRequest() { exportRequest = null }
+
+    // Keep backward compat for callers still using requestPsdExport
+    fun requestPsdExport() { requestExport(ExportType.PSD) }
+
+    // Called when loading a saved canvas
+    fun loadFromCanvasData(data: CanvasData) {
+        layers.clear()
+        layers.addAll(data.layers)
+        activeLayerId = data.activeLayerId
+        canvasId = data.id
+        canvasTitle = data.title
+        canvasDocWidth  = data.width
+        canvasDocHeight = data.height
+        undoStack.clear()
+        redoStack.clear()
+        filterPreview = null
+        pendingPixelUploads = data.layerPixels
+        pendingPixelWidth   = data.width
+        pendingPixelHeight  = data.height
+        pixelUploadVersion++
+        strokeVersion++
+    }
+
+    // Called when creating a new empty canvas
+    fun newCanvas(title: String = "無題") {
+        layers.clear()
+        layers.add(PaintLayer(name = "レイヤー 1"))
+        activeLayerId = layers.first().id
+        canvasId = java.util.UUID.randomUUID().toString()
+        canvasTitle = title
+        canvasDocWidth = 0
+        canvasDocHeight = 0
+        undoStack.clear()
+        redoStack.clear()
+        filterPreview = null
+        pendingPixelUploads = null
+        pixelUploadVersion++
+        strokeVersion++
+    }
+
+    fun setCanvasTitleDirectly(title: String) { canvasTitle = title }
+
+    /**
+     * 外部からインポートした Bitmap を新規キャンバスとして読み込む。
+     * pixels は GL 座標系 (y=0 が下端、プリマルチプライドなし) に変換して渡す。
+     */
+    fun importBitmap(bitmap: android.graphics.Bitmap, title: String) {
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        // Android ARGB → GL RGBA (y-flip, straight alpha)
+        val bytes = ByteArray(w * h * 4)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val px  = src[y * w + x]
+                val glY = h - 1 - y
+                val off = (glY * w + x) * 4
+                bytes[off    ] = ((px shr 16) and 0xFF).toByte()
+                bytes[off + 1] = ((px shr  8) and 0xFF).toByte()
+                bytes[off + 2] = (px and 0xFF).toByte()
+                bytes[off + 3] = ((px shr 24) and 0xFF).toByte()
+            }
+        }
+        layers.clear()
+        val newLayer = PaintLayer(name = "レイヤー 1")
+        layers.add(newLayer)
+        activeLayerId      = newLayer.id
+        canvasId           = java.util.UUID.randomUUID().toString()
+        canvasTitle        = title
+        canvasDocWidth     = w
+        canvasDocHeight    = h
+        undoStack.clear()
+        redoStack.clear()
+        filterPreview      = null
+        pendingPixelUploads  = listOf(Pair(newLayer.id, bytes))
+        pendingPixelWidth    = w
+        pendingPixelHeight   = h
+        pixelUploadVersion++
+        strokeVersion++
+    }
+
+    // Called after pixels are uploaded, to acknowledge completion
+    fun clearPendingPixelUploads() {
+        pendingPixelUploads = null
+    }
+
+    // ── Filter ──
+
+    @JvmName("updateFilterPreview")
+    fun setFilterPreview(filter: LayerFilter?) { filterPreview = filter }
+
+    fun applyFilter() {
+        val filter = filterPreview ?: return
+        val layerId = activeLayerId
+        val idx = layers.indexOfFirst { it.id == layerId }
+        if (idx < 0) return
+        val prev = layers[idx].filter
+        layers[idx] = layers[idx].copy(filter = filter)
+        pushUndo(CanvasAction.SetLayerFilter(layerId, filter, prev))
+        filterPreview = null
+    }
+
+    fun cancelFilter() { filterPreview = null }
 
     /**
      * キャプチャされたコンポジットピクセルから色をサンプリングしてカレントカラーに設定する。
@@ -183,20 +319,6 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ── Pixel sampling helpers ──
-
-    /**
-     * キャンバス座標からアルファ値のみをサンプル。
-     * 透明ピクセル (alpha=0) でも 0f を返す (null を返さない)。
-     * キャプチャが未取得の場合は 0f を返す。
-     */
-    private fun sampleAlphaAt(position: Offset): Float {
-        val pixels = capturedPixels ?: return 0f
-        val w = capturedW; val h = capturedH
-        val px = position.x.toInt().coerceIn(0, w - 1)
-        val py = (h - 1 - position.y.toInt()).coerceIn(0, h - 1)
-        val off = (py * w + px) * 4
-        return (pixels[off + 3].toInt() and 0xFF) / 255f
-    }
 
     /**
      * キャンバス座標 (Y上向き=画面上端) から GL ピクセルバッファをサンプル。
@@ -277,9 +399,7 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
      * canvasAlpha を alpha に格納して返す (GPU 側で透明域でのスタンプ抑制に使用)。
      */
     private fun canvasBlurMix(position: Offset, blurRadius: Int): Color? {
-        val canvasAlpha = sampleAlphaAt(position)
-        val blurred = sampleWeightedBlurAt(position, blurRadius) ?: return null
-        return blurred.copy(alpha = canvasAlpha)
+        return sampleWeightedBlurAt(position, blurRadius)
     }
 
     /**
@@ -321,13 +441,11 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
 
             // ── Fude: 微弱キャンバス吸収 + 強いブラシ色補充 → 引きずり感のある筆 ──
             BrushType.Fude -> {
-                val canvasAlpha = sampleAlphaAt(position)
                 // 水分量: 低筆圧ほど有効水分量が高まる (仕様書: 筆圧低→水分量高)
                 val effectiveWater = (brushSettings.waterContent * (1f + (1f - pressure) * 0.5f)).coerceIn(0f, 1f)
-                // ぼかし筆圧モード: blurPressureThreshold + 高水分量×低筆圧で自動発動
-                val waterBlurBoost = brushSettings.waterContent * brushSettings.waterContent * 0.4f
-                val effectiveBlurThreshold = brushSettings.blurPressureThreshold + waterBlurBoost
-                if (effectiveBlurThreshold > 0f && pressure < effectiveBlurThreshold) {
+                // ぼかし筆圧モード: blurPressureThreshold が明示的に設定された場合のみ発動。
+                // waterBlurBoost を廃止 (CPU/GPU の blurThreshold 不整合を防ぐ)。
+                if (brushSettings.blurPressureThreshold > 0f && pressure < brushSettings.blurPressureThreshold) {
                     val r = (brushSettings.size * 0.20f).toInt().coerceIn(2, 18)
                     canvasBlurMix(position, r)
                 } else {
@@ -335,6 +453,8 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
                     // 1点サンプリングではなく重み付きブラーで周辺色を読む → 色の拡散を改善
                     val diffuseR = (brushSettings.size * 0.20f).toInt().coerceIn(2, 15)
                     val canvasRgb = sampleWeightedBlurAt(position, diffuseR)
+                    // 重み付き平均アルファを使用 (単一ピクセルより滑らか)
+                    val canvasAlpha = canvasRgb?.alpha ?: 0f
                     val ink = strokeInkColor ?: currentColor.copy(alpha = 1f)
                     val p  = pressure.coerceIn(0f, 1f)
                     val ps = p * p * (3f - 2f * p)
@@ -357,21 +477,24 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
 
             // ── Watercolor: 走行インクはブラシ色へ収束、スタンプ毎にキャンバスと混色 ──
             BrushType.Watercolor -> {
-                val canvasAlpha = sampleAlphaAt(position)
                 val effectiveWater = (brushSettings.waterContent * (1f + (1f - pressure) * 0.5f)).coerceIn(0f, 1f)
-                val waterBlurBoost = brushSettings.waterContent * brushSettings.waterContent * 0.4f
-                val effectiveBlurThreshold = brushSettings.blurPressureThreshold + waterBlurBoost
-                if (effectiveBlurThreshold > 0f && pressure < effectiveBlurThreshold) {
-                    val r = (brushSettings.size * 0.30f).toInt().coerceIn(3, 30)
+                // ぼかし強度倍率: 1=デフォルト半径, 100=10倍の半径 (線形補間)
+                val blurMult = 1f + (brushSettings.watercolorBlurStrength - 1) / 99f * 9f
+                // waterBlurBoost を廃止 (CPU/GPU 不整合解消)。blurPressureThreshold が0のとき
+                // blur モードに入らず、キャンバス上に何もない場合でも正しくブラシ色が描画される。
+                if (brushSettings.blurPressureThreshold > 0f && pressure < brushSettings.blurPressureThreshold) {
+                    val r = (brushSettings.size * 0.30f * blurMult).toInt().coerceIn(3, 150)
                     canvasBlurMix(position, r)
                 } else {
                     val p  = pressure.coerceIn(0f, 1f)
                     val ps = p * p * (3f - 2f * p)
                     val mixScale = if (brushSettings.pressureMixEnabled)
                         pressureCurveWithIntensity(pressure, brushSettings.pressureMixIntensity) else 1f
-                    // Step 1: サンプリング半径を拡大 (拡散改善) + 水分量でさらに広がる
-                    val samplingRadius = (brushSettings.size * 0.25f * (1f + effectiveWater * 0.5f)).toInt().coerceIn(3, 30)
+                    // Step 1: サンプリング半径を拡大 (拡散改善) + 水分量でさらに広がる + ぼかし強度倍率
+                    val samplingRadius = (brushSettings.size * 0.25f * (1f + effectiveWater * 0.5f) * blurMult).toInt().coerceIn(3, 150)
                     val canvasRgb = sampleWeightedBlurAt(position, samplingRadius)
+                    // 重み付き平均アルファを使用 (単一ピクセルより滑らか)
+                    val canvasAlpha = canvasRgb?.alpha ?: 0f
                     val refreshWaterScale = (1f - effectiveWater * 0.7f).coerceAtLeast(0.05f)
                     val refreshRate = (brushSettings.density * mixScale * WATERCOLOR_REFRESH_RATE * ps * refreshWaterScale)
                         .coerceIn(0f, 0.9f)
@@ -393,7 +516,8 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
                 val sampled = samplePixelAt(position)
                 val drag    = brushSettings.colorStretch
                 if (sampled != null) {
-                    val strength = brushSettings.density.coerceIn(0.1f, 0.9f)
+                    // 筆ツール混色に近いバランスで既存色とインクを混ぜる (density=1.0 で約60%インク)
+                    val strength = (brushSettings.density * 0.45f + 0.15f).coerceIn(0.1f, 0.65f)
                     val freshMix = lerp(sampled, currentColor, strength)
                     val carried  = strokeInkColor
                     val dragged  = if (carried != null && drag > 0f)
@@ -745,6 +869,10 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
                         activeLayerId = layers[maxOf(0, idx - 1)].id
                 }
             }
+            is CanvasAction.SetLayerFilter -> {
+                val idx = layers.indexOfFirst { it.id == action.layerId }
+                if (idx >= 0) layers[idx] = layers[idx].copy(filter = action.previousFilter)
+            }
         }
     }
 
@@ -778,6 +906,10 @@ class PaintViewModel(application: Application) : AndroidViewModel(application) {
             is CanvasAction.DuplicateLayer -> {
                 layers.add(minOf(action.atIndex, layers.size), action.newLayer)
                 activeLayerId = action.newLayer.id
+            }
+            is CanvasAction.SetLayerFilter -> {
+                val idx = layers.indexOfFirst { it.id == action.layerId }
+                if (idx >= 0) layers[idx] = layers[idx].copy(filter = action.newFilter)
             }
         }
     }

@@ -102,6 +102,17 @@ fun BrushPanel(
                 )
             }
 
+            // ── ぼかし強度 (Watercolor のみ) ────────────────────────────
+            if (b.type == BrushType.Watercolor) {
+                LabeledSlider(
+                    label    = "ぼかし強度",
+                    value    = b.watercolorBlurStrength.toFloat(),
+                    range    = 1f..100f,
+                    display  = "${b.watercolorBlurStrength}",
+                    onValueChange = { vm.setBrushWatercolorBlurStrength(it.roundToInt()) },
+                )
+            }
+
             // ── ハードネス (Pencil・Marker・Eraser・Fude・Watercolor・Airbrush) ──
             val showHardness = b.type != BrushType.Blur
             if (showHardness) {

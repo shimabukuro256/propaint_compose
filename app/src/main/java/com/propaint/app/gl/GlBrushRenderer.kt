@@ -75,7 +75,7 @@ internal class GlBrushRenderer {
         when (stroke.brush.type) {
             BrushType.Eraser -> renderEraserStamps(stroke)
             BrushType.Blur   -> renderBlurStamps(stroke, applyExitTaper = true)
-            // ベイクパスでは抜きテーパーも適用 (全ポイント確定済みのため totalLen が正確)
+            // Marker: GL_MAX alpha でスタンプ蓄積を1パス分に制限し不透明暴走を防ぐ
             BrushType.Marker -> renderCspStamps(stroke, useMaxAlpha = true, applyExitTaper = true)
             else             -> renderCspStamps(stroke, applyExitTaper = true)
         }
@@ -137,17 +137,16 @@ internal class GlBrushRenderer {
         val b    = stroke.brush
         val pts  = stroke.points
         // 通常スタンプ頂点バッファ
-        val verts      = ArrayList<Float>()
-        // ぼかし筆圧モード用 2 パスバッファ (Fude / Watercolor の blur threshold 時)
-        val blurEraser = ArrayList<Float>()  // Pass 1: dest-out
-        val blurColor  = ArrayList<Float>()  // Pass 2: additive
+        val verts     = ArrayList<Float>()
+        // Fude / Watercolor 用 SrcOver バッファ
+        val blurColor = ArrayList<Float>()
         var distToNextStamp = initialDistToNextStamp
 
         val isFudeWc   = b.type == BrushType.Fude || b.type == BrushType.Watercolor
         val hasPointColor = isFudeWc || b.type == BrushType.Marker
         val isAirbrush = b.type == BrushType.Airbrush
-        // Marker: 均一線幅が特性のためテーパーなし。Eraser: 均一消去のためテーパーなし。
-        val applyTaper = b.type != BrushType.Marker && b.type != BrushType.Eraser
+        // Eraser: 均一消去のためテーパーなし。Marker はサイズ+アルファのテーパーあり (SAI 参考挙動)。
+        val applyTaper = b.type != BrushType.Eraser
 
         // ── 累積距離の事前計算 (入りぬきテーパー用) ────────────────────────
         // ライブパスでも fromSegIdx=0 から全点分を計算する (正確な入り距離のため)。
@@ -163,6 +162,9 @@ internal class GlBrushRenderer {
         val nominalRadius = b.size / 2f
         val spacingRadius = minOf(nominalRadius, sqrt(nominalRadius * SPACING_COMPRESS_BASE))
         val stepDist = maxOf(1f, spacingRadius * 2f * b.spacing)
+        // 実効間隔比: 大ブラシの spacingRadius 圧縮を考慮した「直径あたりのステップ比率」
+        // これを補正式の spacing として使うことで、ブラシサイズに依らず一定の視覚密度になる。
+        val effectiveSpacing = (spacingRadius / nominalRadius * b.spacing).coerceAtLeast(0.001f)
 
         for (i in fromSegIdx until pts.size - 1) {
             val p0 = pts[i]; val p1 = pts[i + 1]
@@ -227,14 +229,19 @@ internal class GlBrushRenderer {
                     else -> 1f
                 }
                 // ブラシ種別ごとの密度スケール
-                // Fude / Watercolor は水分量が高いほどスタンプのアルファが下がる (描画色の薄まり)
+                // Fude: SrcOver蓄積方式、opacity でキャップ。density が stampAlpha を制御。
+                // Watercolor: GL_MAX方式 (1パス分の alpha が上限)、opacity でキャップ。
+                //   水分量が高いほどスタンプのアルファが下がり、より透明な水彩になる。
                 val effectiveDensity = when (b.type) {
                     BrushType.Fude       -> b.density * 0.45f * (1f - b.waterContent * 0.5f).coerceAtLeast(0.2f)
-                    BrushType.Watercolor -> b.density * 0.18f * (1f - b.waterContent * 0.5f).coerceAtLeast(0.2f)
+                    BrushType.Watercolor -> b.density * 0.40f * (1f - b.waterContent * 0.6f).coerceAtLeast(0.15f)
                     BrushType.Airbrush   -> b.density * 0.5f
                     else                 -> b.density
                 }
-                val stampAlpha = (effectiveDensity * pressureAlpha * taperFactor).coerceIn(0f, 1f)
+                // 間隔補正: spacing に依らず均一な視覚密度を維持する
+                // base = effectiveDensity × pressureAlpha を spacing=1.0 基準で補正し、
+                // 間隔が狭いほど per-stamp alpha を下げ、広いほど上げる。
+                val stampAlpha = (spacingCompensate(effectiveDensity * pressureAlpha, effectiveSpacing) * taperFactor).coerceIn(0f, 1f)
 
                 when {
                     isAirbrush -> {
@@ -242,27 +249,25 @@ internal class GlBrushRenderer {
                     }
 
                     isFudeWc -> {
+                        // SrcOver 方式: premultiplied SrcOver で収束。
+                        // 2パス(dest-out + additive)はバッチ内スタンプが重なると
+                        // 消去量(乗算)より加算量が上回り白飛びするため廃止。
+                        //
+                        // finalAlpha = (1-wc) + wc * canvasAlpha:
+                        //   waterContent=0 → 収束alpha=1 (不透明)
+                        //   waterContent=1, canvasAlpha=1 → 収束alpha=1
+                        //   waterContent=1, canvasAlpha=0 → 収束alpha=0 (空キャンバスに描けない)
                         val a0 = p0.color?.alpha ?: 0f
                         val a1 = p1.color?.alpha ?: 0f
                         val canvasAlpha = (a0 + (a1 - a0) * t).coerceIn(0f, 1f)
-                        val rgb0 = p0.color ?: stroke.color
-                        val rgb1 = p1.color ?: stroke.color
-                        val stampColor = lerpColor(rgb0, rgb1, t)
-
-                        // ── ぼかし筆圧モード ─────────────────────────────────
-                        // blurPressureThreshold > 0 かつ低筆圧: 色を置かず周辺色を拡散する。
-                        // ViewModel の canvasBlurMix() が返した「重み付きサンプリング色」を
-                        // Blur ブラシと同じ 2 パス (dest-out + additive) で書き込む。
-                        // → SrcOver と異なり alpha が増加しないため純粋なぼかしになる。
-                        if (b.blurPressureThreshold > 0f && pressure < b.blurPressureThreshold) {
-                            val blurA = blurColor(canvasAlpha = canvasAlpha, stampAlpha = stampAlpha)
-                            if (blurA > 0.001f && stampAlpha > 0.001f) {
-                                addStampQuad(blurEraser, px, py, taperR, stampAlpha,  Color.Black)
-                                addStampQuad(blurColor,  px, py, taperR, blurA,        stampColor.copy(alpha = 1f))
-                            }
-                        } else {
-                            // 通常描画モード: StrokePoint.color (ViewModel 混色結果) をそのまま使用
-                            addStampQuad(verts, px, py, taperR, stampAlpha, stampColor.copy(alpha = 1f))
+                        val blurR0 = (p0.color ?: stroke.color).copy(alpha = 1f)
+                        val blurR1 = (p1.color ?: stroke.color).copy(alpha = 1f)
+                        val blurredColor = lerpColor(blurR0, blurR1, t)
+                        val wc = b.waterContent
+                        val finalColor = lerpColor(stroke.color.copy(alpha = 1f), blurredColor, wc)
+                        val finalAlpha = ((1f - wc) + wc * canvasAlpha).coerceIn(0f, 1f)
+                        if (stampAlpha > 0.001f && finalAlpha > 0.001f) {
+                            addStampQuad(blurColor, px, py, taperR, finalAlpha * stampAlpha, finalColor)
                         }
                     }
 
@@ -284,23 +289,10 @@ internal class GlBrushRenderer {
             distToNextStamp = pos - segLen
         }
 
-        if (verts.isNotEmpty())      drawStampVerts(verts, b.hardness, b.antiAliasing, useMaxAlpha)
-        // ぼかし筆圧モードのスタンプを Blur と同じ 2 パスで描画 (縁クッキリ: hardness=1.0)
-        if (blurEraser.isNotEmpty()) {
-            drawEraserStampVerts(blurEraser, 1.0f, b.antiAliasing)
-            drawStampVertsAdditive(blurColor, 1.0f, b.antiAliasing)
-        }
+        if (verts.isNotEmpty())     drawStampVerts(verts, b.hardness, b.antiAliasing, useMaxAlpha)
+        if (blurColor.isNotEmpty()) drawStampVerts(blurColor, b.hardness, b.antiAliasing)
         return distToNextStamp
     }
-
-    /**
-     * ぼかし筆圧モードのスタンプアルファ計算。
-     * canvasAlpha = sampleWeightedBlurAt の avgA (ぼかし色の重み付き平均アルファ)。
-     * blurAlpha × stampAlpha が Pass 2 (additive) のアルファとなる。
-     * → 透明域 (canvasAlpha≈0) ではぼかすものがないため何も描画しない。
-     */
-    private fun blurColor(canvasAlpha: Float, stampAlpha: Float): Float =
-        (canvasAlpha * stampAlpha).coerceIn(0f, 1f)
 
     // ── Blur スタンプ (2 パス置換レンダリング) ──────────────────────────────
     //
@@ -326,8 +318,7 @@ internal class GlBrushRenderer {
         val pts = stroke.points
         var distToNextStamp = initialDistToNextStamp
 
-        val eraserVerts = ArrayList<Float>()  // Pass 1: dest-out
-        val colorVerts  = ArrayList<Float>()  // Pass 2: additive
+        val colorVerts = ArrayList<Float>()
 
         val cumDist = FloatArray(pts.size)
         for (k in 1 until pts.size) {
@@ -341,6 +332,7 @@ internal class GlBrushRenderer {
         val nominalRadius = b.size / 2f
         val spacingRadius = minOf(nominalRadius, sqrt(nominalRadius * SPACING_COMPRESS_BASE))
         val stepDist = maxOf(1f, spacingRadius * 2f * b.spacing)
+        val effectiveSpacing = (spacingRadius / nominalRadius * b.spacing).coerceAtLeast(0.001f)
 
         for (i in fromSegIdx until pts.size - 1) {
             val p0 = pts[i]; val p1 = pts[i + 1]
@@ -379,7 +371,7 @@ internal class GlBrushRenderer {
                 } else 1f
 
                 val taperR     = (r * taperFactor).coerceAtLeast(0.5f)
-                val stampAlpha = (b.density * pressureCurve(pressure) * taperFactor).coerceIn(0f, 1f)
+                val stampAlpha = (spacingCompensate(b.density * pressureCurve(pressure), effectiveSpacing) * taperFactor).coerceIn(0f, 1f)
 
                 // ブラー色: StrokePoint.color = canvasMix() のボックスブラー結果
                 val c0 = p0.color ?: Color(0f, 0f, 0f, 0f)
@@ -388,9 +380,6 @@ internal class GlBrushRenderer {
                 val blurAlpha = blurColor.alpha  // ブラーされた近傍の平均 alpha
 
                 if (blurAlpha > 0.001f && stampAlpha > 0.001f) {
-                    // Pass 1: この位置の既存ピクセルを消去
-                    addStampQuad(eraserVerts, px, py, taperR, stampAlpha, Color.Black)
-                    // Pass 2: ブラー色をプリマルチプライド加算
                     addStampQuad(colorVerts, px, py, taperR, blurAlpha * stampAlpha, blurColor.copy(alpha = 1f))
                 }
 
@@ -399,10 +388,7 @@ internal class GlBrushRenderer {
             distToNextStamp = pos - segLen
         }
 
-        if (eraserVerts.isNotEmpty()) {
-            drawEraserStampVerts(eraserVerts, 1.0f, b.antiAliasing)   // dest-out blend (縁クッキリ)
-            drawStampVertsAdditive(colorVerts, 1.0f, b.antiAliasing)  // GL_ONE, GL_ONE blend (縁クッキリ)
-        }
+        if (colorVerts.isNotEmpty()) drawStampVerts(colorVerts, 1.0f, b.antiAliasing)
         return distToNextStamp
     }
 
@@ -457,6 +443,7 @@ internal class GlBrushRenderer {
         val nominalRadius = b.size / 2f
         val spacingRadius = minOf(nominalRadius, sqrt(nominalRadius * SPACING_COMPRESS_BASE))
         val stepDist = maxOf(1f, spacingRadius * 2f * b.spacing)
+        val effectiveSpacing = (spacingRadius / nominalRadius * b.spacing).coerceAtLeast(0.001f)
 
         for (i in fromSegIdx until pts.size - 1) {
             val p0 = pts[i]; val p1 = pts[i + 1]
@@ -478,8 +465,8 @@ internal class GlBrushRenderer {
 
                 val pressureAlpha = if (b.pressureSizeEnabled)
                     (0.2f + 0.8f * pressureCurve(pressure)).coerceIn(0f, 1f) else 1f
-                // 消しゴムの alpha は density × pressureAlpha (opacity=1 固定)
-                val stampAlpha = (b.density * pressureAlpha).coerceIn(0f, 1f)
+                // 消しゴムの alpha は density × pressureAlpha に間隔補正を適用
+                val stampAlpha = spacingCompensate(b.density * pressureAlpha, effectiveSpacing)
 
                 // ERASER_STAMP_FRAG は color 属性を使わないが stride を合わせるため Color.Black を渡す
                 addStampQuad(verts, px, py, r, stampAlpha, Color.Black)
@@ -635,6 +622,29 @@ internal class GlBrushRenderer {
      *   p=0.1 → 0.22, p=0.3 → 0.51, p=0.5 → 0.64, p=0.7 → 0.78
      */
     private fun pressureCurve(p: Float): Float = p.coerceIn(0f, 1f).toDouble().pow(0.65).toFloat()
+
+    /**
+     * 間隔補正: spacing に依らず均一な視覚密度を保つための per-stamp alpha 計算。
+     *
+     * SrcOver ブレンドで n スタンプを重ねると:  coverage = 1 - (1 - a)^n
+     * spacing=1.0 を基準 (1 stamp/diameter) とすると、spacing=s のとき n = 1/s。
+     *
+     * coverage を一定 (= target) に保つ条件:
+     *   1 - (1 - a_stamp)^(1/s) = target
+     *   → a_stamp = 1 - (1 - target)^s
+     *
+     * spacing < 1 (狭い): 多くのスタンプが重なるため per-stamp alpha を下げる
+     * spacing > 1 (広い): スタンプが疎になるため per-stamp alpha を上げる
+     * spacing = 1 (基準): 変化なし
+     *
+     * @param density spacing=1.0 時の目標 per-stamp alpha (pressureAlpha × effectiveDensity)
+     * @param spacing 実効間隔比 (= spacingRadius/nominalRadius × b.spacing)
+     */
+    private fun spacingCompensate(density: Float, spacing: Float): Float {
+        val s = spacing.coerceAtLeast(0.001f)
+        val base = (1f - density).coerceIn(0f, 1f)
+        return (1f - base.toDouble().pow(s.toDouble()).toFloat()).coerceIn(0f, 1f)
+    }
 
     /**
      * 感度付き筆圧カーブ: p^gamma

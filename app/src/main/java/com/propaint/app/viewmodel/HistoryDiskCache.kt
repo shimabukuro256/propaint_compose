@@ -69,6 +69,14 @@ internal class HistoryDiskCache(private val cacheDir: File) {
                 writeLayer(out, action.newLayer)
                 out.writeInt(action.atIndex)
             }
+            is CanvasAction.SetLayerFilter -> {
+                out.writeInt(6)
+                out.writeUTF(action.layerId)
+                out.writeBoolean(action.newFilter != null)
+                action.newFilter?.let { writeFilter(out, it) }
+                out.writeBoolean(action.previousFilter != null)
+                action.previousFilter?.let { writeFilter(out, it) }
+            }
         }
     }
 
@@ -104,6 +112,12 @@ internal class HistoryDiskCache(private val cacheDir: File) {
                 val newLayer = readLayer(inp)
                 val atIndex  = inp.readInt()
                 CanvasAction.DuplicateLayer(newLayer, atIndex)
+            }
+            6 -> {
+                val layerId    = inp.readUTF()
+                val newFilter  = if (inp.readBoolean()) readFilter(inp) else null
+                val prevFilter = if (inp.readBoolean()) readFilter(inp) else null
+                CanvasAction.SetLayerFilter(layerId, newFilter, prevFilter)
             }
             else -> throw IOException("Unknown action type")
         }
@@ -165,6 +179,8 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         out.writeInt(bs.pressureOpacityIntensity)
         out.writeBoolean(bs.pressureMixEnabled)
         out.writeInt(bs.pressureMixIntensity)
+        out.writeFloat(bs.waterContent)
+        out.writeFloat(bs.antiAliasing)
     }
 
     private fun readBrushSettings(inp: DataInputStream): BrushSettings {
@@ -187,6 +203,8 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         val pressureOpacityIntensity = try { inp.readInt() } catch (_: Exception) { 100 }
         val pressureMixEnabled       = try { inp.readBoolean() } catch (_: Exception) { false }
         val pressureMixIntensity     = try { inp.readInt() } catch (_: Exception) { 100 }
+        val waterContent             = try { inp.readFloat() } catch (_: Exception) { type.defaultWaterContent }
+        val antiAliasing             = try { inp.readFloat() } catch (_: Exception) { 1.0f }
         return BrushSettings(
             type                     = type,
             size                     = size,
@@ -205,6 +223,8 @@ internal class HistoryDiskCache(private val cacheDir: File) {
             pressureOpacityIntensity = pressureOpacityIntensity,
             pressureMixEnabled       = pressureMixEnabled,
             pressureMixIntensity     = pressureMixIntensity,
+            waterContent             = waterContent,
+            antiAliasing             = antiAliasing,
         )
     }
 
@@ -220,6 +240,9 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         out.writeInt(layer.strokes.size)
         layer.strokes.forEach { writeStroke(out, it) }
         out.writeBoolean(layer.isClippingMask)
+        val f = layer.filter
+        out.writeBoolean(f != null)
+        if (f != null) writeFilter(out, f)
     }
 
     private fun readLayer(inp: DataInputStream): PaintLayer {
@@ -231,7 +254,31 @@ internal class HistoryDiskCache(private val cacheDir: File) {
         val blendMode = LayerBlendMode.entries.getOrElse(inp.readInt()) { LayerBlendMode.Normal }
         val strokes   = List(inp.readInt()) { readStroke(inp) }
         val isClippingMask = try { inp.readBoolean() } catch (_: Exception) { false }
-        return PaintLayer(id, name, isVisible, isLocked, opacity, blendMode, strokes, isClippingMask)
+        val filter = if (try { inp.readBoolean() } catch (_: Exception) { false }) readFilter(inp) else null
+        return PaintLayer(id, name, isVisible, isLocked, opacity, blendMode, strokes, isClippingMask, filter)
+    }
+
+    private fun writeFilter(out: DataOutputStream, f: LayerFilter) {
+        out.writeInt(f.type.ordinal)
+        out.writeFloat(f.hue)
+        out.writeFloat(f.saturation)
+        out.writeFloat(f.lightness)
+        out.writeFloat(f.blurRadius)
+        out.writeFloat(f.contrast)
+        out.writeFloat(f.brightness)
+    }
+
+    private fun readFilter(inp: DataInputStream): LayerFilter {
+        val type = FilterType.entries.getOrElse(inp.readInt()) { FilterType.HSL }
+        return LayerFilter(
+            type       = type,
+            hue        = inp.readFloat(),
+            saturation = inp.readFloat(),
+            lightness  = inp.readFloat(),
+            blurRadius = inp.readFloat(),
+            contrast   = inp.readFloat(),
+            brightness = inp.readFloat(),
+        )
     }
 
     // ── Color ────────────────────────────────────────────────────────────────

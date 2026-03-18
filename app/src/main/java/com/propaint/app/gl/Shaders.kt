@@ -156,4 +156,113 @@ void main() {
     )
     val COMPOSITE_FRAG_DARKEN   = blendShader("min(Cs, Cd)")
     val COMPOSITE_FRAG_LIGHTEN  = blendShader("max(Cs, Cd)")
+
+    // ── フィルターシェーダー (COMPOSITE_VERT と共用) ──────────────────────
+
+    /** 色相/彩度/明度フィルター (HSL 変換・in-place) */
+    const val FILTER_HSL_FRAG = """
+precision mediump float;
+uniform sampler2D uTex;
+uniform float uAlpha;
+uniform float uHue;
+uniform float uSat;
+uniform float uLit;
+varying vec2 vUV;
+float h2r(float p, float q, float t) {
+    float tt = t < 0.0 ? t + 1.0 : (t > 1.0 ? t - 1.0 : t);
+    if (tt < 0.16667) return p + (q - p) * 6.0 * tt;
+    if (tt < 0.5)     return q;
+    if (tt < 0.66667) return p + (q - p) * (0.66667 - tt) * 6.0;
+    return p;
+}
+void main() {
+    vec4 c = texture2D(uTex, vUV);
+    if (c.a < 0.001) { gl_FragColor = vec4(0.0); return; }
+    vec3 rgb = c.rgb / c.a;
+    float maxC = max(max(rgb.r, rgb.g), rgb.b);
+    float minC = min(min(rgb.r, rgb.g), rgb.b);
+    float l = (maxC + minC) * 0.5;
+    float h = 0.0; float s = 0.0;
+    float delta = maxC - minC;
+    if (delta > 0.001) {
+        s = delta / (1.0 - abs(2.0 * l - 1.0));
+        if (maxC == rgb.r) h = (rgb.g - rgb.b) / delta + (rgb.g < rgb.b ? 6.0 : 0.0);
+        else if (maxC == rgb.g) h = (rgb.b - rgb.r) / delta + 2.0;
+        else h = (rgb.r - rgb.g) / delta + 4.0;
+        h /= 6.0;
+    }
+    h = fract(h + uHue / 360.0);
+    s = clamp(s + uSat, 0.0, 1.0);
+    l = clamp(l + uLit, 0.0, 1.0);
+    vec3 nr;
+    if (s < 0.001) { nr = vec3(l); } else {
+        float q2 = l < 0.5 ? l*(1.0+s) : l+s-l*s;
+        float p2 = 2.0*l - q2;
+        nr = vec3(h2r(p2,q2,h+0.33333), h2r(p2,q2,h), h2r(p2,q2,h-0.33333));
+    }
+    float a = c.a * uAlpha;
+    gl_FragColor = vec4(clamp(nr,0.0,1.0) * a, a);
+}"""
+
+    /** ガウスブラー (水平パス, 9タップ分離可能カーネル) */
+    const val FILTER_BLUR_H_FRAG = """
+precision mediump float;
+uniform sampler2D uTex;
+uniform float uAlpha;
+uniform float uRadius;
+uniform vec2 uTexelSize;
+varying vec2 vUV;
+void main() {
+    float r = uRadius * uTexelSize.x;
+    vec4 c = texture2D(uTex, vUV)                     * 0.2270;
+    c += texture2D(uTex, vUV + vec2( r,     0.0)) * 0.1945;
+    c += texture2D(uTex, vUV + vec2(-r,     0.0)) * 0.1945;
+    c += texture2D(uTex, vUV + vec2( 2.0*r, 0.0)) * 0.1216;
+    c += texture2D(uTex, vUV + vec2(-2.0*r, 0.0)) * 0.1216;
+    c += texture2D(uTex, vUV + vec2( 3.0*r, 0.0)) * 0.0540;
+    c += texture2D(uTex, vUV + vec2(-3.0*r, 0.0)) * 0.0540;
+    c += texture2D(uTex, vUV + vec2( 4.0*r, 0.0)) * 0.0162;
+    c += texture2D(uTex, vUV + vec2(-4.0*r, 0.0)) * 0.0162;
+    gl_FragColor = vec4(c.rgb * uAlpha, c.a * uAlpha);
+}"""
+
+    /** ガウスブラー (垂直パス) */
+    const val FILTER_BLUR_V_FRAG = """
+precision mediump float;
+uniform sampler2D uTex;
+uniform float uAlpha;
+uniform float uRadius;
+uniform vec2 uTexelSize;
+varying vec2 vUV;
+void main() {
+    float r = uRadius * uTexelSize.y;
+    vec4 c = texture2D(uTex, vUV)                     * 0.2270;
+    c += texture2D(uTex, vUV + vec2(0.0,  r    )) * 0.1945;
+    c += texture2D(uTex, vUV + vec2(0.0, -r    )) * 0.1945;
+    c += texture2D(uTex, vUV + vec2(0.0,  2.0*r)) * 0.1216;
+    c += texture2D(uTex, vUV + vec2(0.0, -2.0*r)) * 0.1216;
+    c += texture2D(uTex, vUV + vec2(0.0,  3.0*r)) * 0.0540;
+    c += texture2D(uTex, vUV + vec2(0.0, -3.0*r)) * 0.0540;
+    c += texture2D(uTex, vUV + vec2(0.0,  4.0*r)) * 0.0162;
+    c += texture2D(uTex, vUV + vec2(0.0, -4.0*r)) * 0.0162;
+    gl_FragColor = vec4(c.rgb * uAlpha, c.a * uAlpha);
+}"""
+
+    /** コントラスト/明るさフィルター */
+    const val FILTER_CONTRAST_FRAG = """
+precision mediump float;
+uniform sampler2D uTex;
+uniform float uAlpha;
+uniform float uContrast;
+uniform float uBrightness;
+varying vec2 vUV;
+void main() {
+    vec4 c = texture2D(uTex, vUV);
+    if (c.a < 0.001) { gl_FragColor = vec4(0.0); return; }
+    vec3 rgb = c.rgb / c.a;
+    rgb = rgb + uBrightness;
+    rgb = (rgb - 0.5) * (1.0 + uContrast * 2.0) + 0.5;
+    float a = c.a * uAlpha;
+    gl_FragColor = vec4(clamp(rgb, 0.0, 1.0) * a, a);
+}"""
 }

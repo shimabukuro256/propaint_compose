@@ -88,6 +88,22 @@ class GlCanvasView(context: Context) : GLSurfaceView(context) {
         requestRender()
     }
 
+    /**
+     * Layer pixel upload: replaces all GL layer FBOs with the provided pixel data.
+     * Used when loading a saved canvas. [onDone] is called on the main thread.
+     */
+    fun queueLayerPixelUploads(
+        uploads: List<Pair<String, ByteArray>>,
+        width: Int,
+        height: Int,
+        onDone: () -> Unit = {},
+    ) {
+        renderer.queueLayerPixelUploads(uploads, width, height) {
+            mainHandler.post { onDone() }
+        }
+        requestRender()
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         queueEvent { renderer.cleanup() }

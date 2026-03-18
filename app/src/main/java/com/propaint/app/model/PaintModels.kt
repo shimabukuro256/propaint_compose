@@ -19,8 +19,8 @@ enum class BrushType(
     val defaultWaterContent: Float,
 ) {
     Pencil("鉛筆",         4f,  0.9f, 0.80f, 0.06f, 0.3f, 0.95f, 0f),
-    Fude("筆",            10f,  0.8f, 0.70f, 0.01f, 0.5f, 1.00f, 0.5f),
-    Watercolor("水彩筆",   14f,  0.7f, 1.00f, 0.01f, 0.6f, 1.00f, 0.7f),
+    Fude("筆",            10f,  0.8f, 0.70f, 0.01f, 0.5f, 0.80f, 0.5f),
+    Watercolor("水彩筆",   14f,  0.7f, 1.00f, 0.01f, 0.6f, 0.20f, 0.7f),
     Airbrush("エアブラシ", 22f,  0.6f, 0.07f, 0.25f, 0.7f, 0.00f, 0f),
     Marker("マーカー",     12f,  0.9f, 1.00f, 0.07f, 0.5f, 1.00f, 0f),
     Eraser("消しゴム",     20f,  1.0f, 1.00f, 0.05f, 0.4f, 0.80f, 0f),
@@ -34,12 +34,12 @@ val BrushType.needsCanvasCapture: Boolean get() =
 
 /**
  * ウェットキャンバス方式が必要なブラシ。
- * これらのブラシはスタンプを strokeMarksFbo に蓄積せず、layerFbo のコピー (wetCanvasFbo) に
- * 直接書き込む。ストローク中に wetCanvasFbo を再キャプチャして CPU 側混色も更新するため、
- * 自分の以前のストロークと真に混合できる。
+ * Blur のみ wetCanvasFbo に直接書き込む。
+ * Fude / Watercolor は strokeMarksFbo + opacity キャップ方式に変更 (SrcOver 直書きによる
+ * アルファ暴走と CPU/GPU 混色不整合を解消するため)。
  */
 val BrushType.needsWetCanvas: Boolean get() =
-    this == BrushType.Fude || this == BrushType.Watercolor || this == BrushType.Blur
+    this == BrushType.Blur || this == BrushType.Fude || this == BrushType.Watercolor
 
 data class BrushSettings(
     val type: BrushType = BrushType.Pencil,
@@ -51,6 +51,8 @@ data class BrushSettings(
     val stabilizer: Float = type.defaultStabilizer,
     /** Blur ツール専用: ボックスブラーの半径倍率 (0=最小, 1=最大) */
     val blurStrength: Float = 0.5f,
+    /** Watercolor ツール専用: ぼかし強度 (1=デフォルト, 100=10倍の半径) */
+    val watercolorBlurStrength: Int = 1,
     /**
      * 色伸び: 前スタンプの色を次スタンプへ引きずる量 (0=引きずりなし, 1=最大)。
      * Fude / Watercolor / Marker で有効。
@@ -127,6 +129,25 @@ data class PaintLayer(
     val blendMode: LayerBlendMode = LayerBlendMode.Normal,
     val strokes: List<Stroke> = emptyList(),
     val isClippingMask: Boolean = false,
+    val filter: LayerFilter? = null,
+)
+
+// ── Filter ──
+
+enum class FilterType {
+    HSL,      // 色相/彩度/明度
+    BLUR,     // ガウスブラー
+    CONTRAST, // コントラスト/明るさ
+}
+
+data class LayerFilter(
+    val type: FilterType,
+    val hue: Float = 0f,           // 色相シフト (-180..180 degrees)
+    val saturation: Float = 0f,    // 彩度デルタ (-1..1)
+    val lightness: Float = 0f,     // 明度デルタ (-1..1)
+    val blurRadius: Float = 0f,    // ぼかし半径 (0..1 正規化)
+    val contrast: Float = 0f,      // コントラストデルタ (-1..1)
+    val brightness: Float = 0f,    // 明るさデルタ (-1..1)
 )
 
 // ── Canvas action for undo/redo ──
@@ -138,4 +159,9 @@ sealed class CanvasAction {
     data class ClearLayer(val layerId: String, val previousStrokes: List<Stroke>) : CanvasAction()
     data class MergeDown(val upper: PaintLayer, val lower: PaintLayer, val upperIndex: Int) : CanvasAction()
     data class DuplicateLayer(val newLayer: PaintLayer, val atIndex: Int) : CanvasAction()
+    data class SetLayerFilter(
+        val layerId: String,
+        val newFilter: LayerFilter?,
+        val previousFilter: LayerFilter?,
+    ) : CanvasAction()
 }

@@ -1,6 +1,5 @@
 package com.propaint.app.ui.components
 
-import android.os.Environment
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
@@ -13,6 +12,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import com.propaint.app.gl.GlCanvasView
 import com.propaint.app.gl.RenderSnapshot
+import com.propaint.app.io.CanvasFileManager
 import com.propaint.app.model.BrushType
 import com.propaint.app.model.needsCanvasCapture
 import com.propaint.app.model.needsWetCanvas
@@ -34,6 +34,7 @@ import kotlin.math.sqrt
 @Composable
 fun DrawingCanvas(
     viewModel: PaintViewModel,
+    onSaveComplete: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -47,15 +48,21 @@ fun DrawingCanvas(
     val _sv = viewModel.strokeVersion
 
     fun screenToCanvas(screen: Offset): Offset {
-        val cx   = canvasWidth  / 2f
-        val cy   = canvasHeight / 2f
+        val cx = canvasWidth  / 2f
+        val cy = canvasHeight / 2f
+        // ドキュメントサイズ (0 = 画面サイズと同じ)
+        val docW = viewModel.canvasDocWidth.takeIf  { it > 0 }?.toFloat() ?: canvasWidth
+        val docH = viewModel.canvasDocHeight.takeIf { it > 0 }?.toFloat() ?: canvasHeight
+        // letterbox スケール × ユーザー zoom の合成
+        val baseScale  = minOf(canvasWidth / docW, canvasHeight / docH)
+        val finalScale = baseScale * viewModel.zoom
         val dx   = screen.x - viewModel.panOffset.x - cx
         val dy   = screen.y - viewModel.panOffset.y - cy
         val cosT = cos(viewModel.rotation.toDouble()).toFloat()
         val sinT = sin(viewModel.rotation.toDouble()).toFloat()
         return Offset(
-            cx + ( cosT * dx + sinT * dy) / viewModel.zoom,
-            cy + (-sinT * dx + cosT * dy) / viewModel.zoom,
+            docW / 2f + ( cosT * dx + sinT * dy) / finalScale,
+            docH / 2f + (-sinT * dx + cosT * dy) / finalScale,
         )
     }
 
@@ -120,7 +127,9 @@ fun DrawingCanvas(
                                             // ウェットキャンバス系ブラシ: フレームごとにキャンバス状態を再取得。
                                             // AtomicReference により GL スレッドは最大 1 フレームに 1 回処理するため
                                             // ここで毎ポイント要求しても glReadPixels は throttle される。
-                                            if (viewModel.brushSettings.type.needsWetCanvas) {
+                                            // needsCanvasCapture ブラシはストローク中も継続的にキャプチャして
+                                            // canvasMix が最新のレイヤー内容を参照できるようにする。
+                                            if (viewModel.brushSettings.type.needsCanvasCapture) {
                                                 requestCapture(viewModel.activeLayerId)
                                             }
                                             change.consume()
@@ -251,7 +260,9 @@ fun DrawingCanvas(
                                             for (h in change.historical)
                                                 viewModel.addStrokePoint(screenToCanvas(h.position), pressure)
                                             viewModel.addStrokePoint(pos, pressure)
-                                            if (viewModel.brushSettings.type.needsWetCanvas) {
+                                            // needsCanvasCapture ブラシはストローク中も継続的にキャプチャして
+                                            // canvasMix が最新のレイヤー内容を参照できるようにする。
+                                            if (viewModel.brushSettings.type.needsCanvasCapture) {
                                                 requestCapture(viewModel.activeLayerId)
                                             }
                                             change.consume()
@@ -273,24 +284,149 @@ fun DrawingCanvas(
         )
     }
 
-    // ── PSD export ──────────────────────────────────────────────────────────
+    // ── Layer pixel upload (for loading saved canvases) ──────────────────
     val coroutineScope = rememberCoroutineScope()
-    LaunchedEffect(viewModel.psdExportRequested) {
-        if (!viewModel.psdExportRequested) return@LaunchedEffect
-        viewModel.clearPsdExportRequest()
+    LaunchedEffect(viewModel.pixelUploadVersion) {
+        val uploads = viewModel.pendingPixelUploads ?: return@LaunchedEffect
+        val w = viewModel.pendingPixelWidth
+        val h = viewModel.pendingPixelHeight
+        glView.queueLayerPixelUploads(uploads, w, h) {
+            viewModel.clearPendingPixelUploads()
+        }
+    }
+
+    // ── Export / Share ────────────────────────────────────────────────────
+    LaunchedEffect(viewModel.exportRequest) {
+        val exportType = viewModel.exportRequest ?: return@LaunchedEffect
+        viewModel.clearExportRequest()
+        val title = viewModel.canvasTitle
+        when (exportType) {
+            PaintViewModel.ExportType.PNG -> {
+                glView.requestCompositeCapture { pixels, w, h ->
+                    coroutineScope.launch {
+                        withContext(Dispatchers.IO) {
+                            val uri = CanvasFileManager.saveTempPng(context, title, pixels, w, h)
+                            if (uri != null) withContext(Dispatchers.Main) {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "image/png"
+                                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(android.content.Intent.createChooser(intent, "PNG として共有"))
+                            }
+                        }
+                    }
+                }
+            }
+            PaintViewModel.ExportType.JPEG -> {
+                glView.requestCompositeCapture { pixels, w, h ->
+                    coroutineScope.launch {
+                        withContext(Dispatchers.IO) {
+                            val uri = CanvasFileManager.saveTempJpeg(context, title, pixels, w, h)
+                            if (uri != null) withContext(Dispatchers.Main) {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "image/jpeg"
+                                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(android.content.Intent.createChooser(intent, "JPEG として共有"))
+                            }
+                        }
+                    }
+                }
+            }
+            PaintViewModel.ExportType.WEBP -> {
+                glView.requestCompositeCapture { pixels, w, h ->
+                    coroutineScope.launch {
+                        withContext(Dispatchers.IO) {
+                            val uri = CanvasFileManager.saveTempWebp(context, title, pixels, w, h)
+                            if (uri != null) withContext(Dispatchers.Main) {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "image/webp"
+                                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(android.content.Intent.createChooser(intent, "WebP として共有"))
+                            }
+                        }
+                    }
+                }
+            }
+            PaintViewModel.ExportType.PSD -> {
+                val layerIds = viewModel.layers.map { it.id }
+                glView.requestAllLayersCapture(layerIds) { layerPixels, w, h ->
+                    coroutineScope.launch {
+                        withContext(Dispatchers.IO) {
+                            val uri = CanvasFileManager.saveTempPsd(context, title, layerPixels, viewModel.layers.toList(), w, h)
+                            if (uri != null) withContext(Dispatchers.Main) {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "application/octet-stream"
+                                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                    putExtra(android.content.Intent.EXTRA_SUBJECT, "$title.psd")
+                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(android.content.Intent.createChooser(intent, "PSD として共有"))
+                            }
+                        }
+                    }
+                }
+            }
+            PaintViewModel.ExportType.PPAINT -> {
+                val layerIds = viewModel.layers.map { it.id }
+                glView.requestAllLayersCapture(layerIds) { layerPixels, w, h ->
+                    glView.requestCompositeCapture { compositePixels, _, _ ->
+                        coroutineScope.launch {
+                            withContext(Dispatchers.IO) {
+                                CanvasFileManager.saveCanvas(
+                                    context,
+                                    viewModel.canvasId,
+                                    viewModel.canvasTitle,
+                                    w, h,
+                                    viewModel.activeLayerId,
+                                    viewModel.layers.toList(),
+                                    layerPixels,
+                                    compositePixels,
+                                )
+                                val uri = CanvasFileManager.getShareUriForCanvas(context, viewModel.canvasId)
+                                if (uri != null) withContext(Dispatchers.Main) {
+                                    val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                        type = "application/octet-stream"
+                                        putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                        putExtra(android.content.Intent.EXTRA_SUBJECT, "${viewModel.canvasTitle}.ppaint")
+                                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(android.content.Intent.createChooser(intent, "ProPaint ファイルとして共有"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Auto-save (ギャラリーへ戻る前にトリガー) ─────────────────────────
+    LaunchedEffect(viewModel.saveCanvasRequest) {
+        if (viewModel.saveCanvasRequest == 0) return@LaunchedEffect
         val layerIds = viewModel.layers.map { it.id }
         glView.requestAllLayersCapture(layerIds) { layerPixels, w, h ->
-            coroutineScope.launch {
-                withContext(Dispatchers.IO) {
+            glView.requestCompositeCapture { compositePixels, _, _ ->
+                coroutineScope.launch {
                     try {
-                        val dir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-                            ?: context.filesDir
-                        dir.mkdirs()
-                        val file = java.io.File(dir, "propaint_export_${System.currentTimeMillis()}.psd")
-                        file.outputStream().use { stream ->
-                            viewModel.exportPsdFromPixels(layerPixels, w, h, stream)
+                        withContext(Dispatchers.IO) {
+                            CanvasFileManager.saveCanvas(
+                                context,
+                                viewModel.canvasId,
+                                viewModel.canvasTitle,
+                                w, h,
+                                viewModel.activeLayerId,
+                                viewModel.layers.toList(),
+                                layerPixels,
+                                compositePixels,
+                            )
                         }
-                    } catch (_: Exception) { /* silently ignore */ }
+                    } catch (_: Exception) { /* ベストエフォート */ }
+                    onSaveComplete()
                 }
             }
         }
@@ -309,6 +445,10 @@ fun DrawingCanvas(
                 panX          = viewModel.panOffset.x,
                 panY          = viewModel.panOffset.y,
                 rotation      = viewModel.rotation,
+                filterPreview = viewModel.filterPreview,
+                filterLayerId = viewModel.activeLayerId,
+                docWidth      = viewModel.canvasDocWidth,
+                docHeight     = viewModel.canvasDocHeight,
             )
         )
     }

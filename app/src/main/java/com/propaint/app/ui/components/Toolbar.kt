@@ -47,6 +47,9 @@ fun TopBar(
     onColorPicker: () -> Unit,
     onLayerPanel: () -> Unit,
     onBrushPanel: () -> Unit,
+    onFilterPanel: () -> Unit,
+    onSharePanel: () -> Unit = {},
+    onGallery: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -112,6 +115,9 @@ fun TopBar(
             }
 
             ToolBtn(Icons.Default.Layers, "レイヤー") { onLayerPanel() }
+            ToolBtn(Icons.Default.Tonality, "フィルター") { onFilterPanel() }
+            ToolBtn(Icons.Default.Share, "共有") { onSharePanel() }
+            ToolBtn(Icons.Default.PhotoLibrary, "ギャラリー") { onGallery() }
         }
 
         HorizontalDivider(color = Color(0xFF2A2A2A), thickness = 0.5.dp)

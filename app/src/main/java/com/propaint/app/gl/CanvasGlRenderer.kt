@@ -27,6 +27,10 @@ data class RenderSnapshot(
     val panX: Float,
     val panY: Float,
     val rotation: Float = 0f,
+    val filterPreview: LayerFilter? = null,
+    val filterLayerId: String = "",
+    val docWidth: Int = 0,   // 0 = use surface dims
+    val docHeight: Int = 0,  // 0 = use surface dims
 )
 
 // ── CanvasGlRenderer ─────────────────────────────────────────────────────
@@ -56,6 +60,27 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
     private val watercolorCaptureRequest =
         AtomicReference<Pair<String, (ByteArray, Int, Int) -> Unit>?>()
 
+    // ── Layer pixel upload (for loading saved canvases) ──────────────────
+    private data class LayerPixelBatch(
+        val uploads: List<Triple<String, ByteArray, Int>>,  // (layerId, pixels, unused)
+        val width: Int,
+        val height: Int,
+        val onDone: () -> Unit,
+    )
+    private val pendingPixelBatch = AtomicReference<LayerPixelBatch?>()
+
+    fun queueLayerPixelUploads(
+        uploads: List<Pair<String, ByteArray>>,
+        width: Int,
+        height: Int,
+        onDone: () -> Unit = {},
+    ) {
+        pendingPixelBatch.set(LayerPixelBatch(
+            uploads.map { (id, px) -> Triple(id, px, 0) },
+            width, height, onDone,
+        ))
+    }
+
     // コンポジットキャプチャリクエスト (スポイト用)
     private val compositeCaptureRequest =
         AtomicReference<((ByteArray, Int, Int) -> Unit)?>()
@@ -80,6 +105,14 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
     private lateinit var darkenComposite:   GlProgram
     private lateinit var lightenComposite:  GlProgram
     private lateinit var gridProgram:       GlProgram
+    private lateinit var filterHslProg:      GlProgram
+    private lateinit var filterBlurHProg:    GlProgram
+    private lateinit var filterBlurVProg:    GlProgram
+    private lateinit var filterContrastProg: GlProgram
+    private var filterTempFbo:  LayerFbo? = null
+    private var filterTemp2Fbo: LayerFbo? = null
+    private var lastFilterHash: Int = 0
+    private var lastFilterLayerId: String = ""
 
     // ── FBO ─────────────────────────────────────────────────────────────
 
@@ -129,6 +162,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         val isVisible: Boolean,
         val opacity: Float,
         val blendModeOrdinal: Int,
+        val filterHash: Int = 0,
     )
     private val layerMeta     = mutableMapOf<String, LayerMeta>()
     private var lastLayerOrder = emptyList<String>()
@@ -136,6 +170,8 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
     private var lastActiveId   = ""
     private var lastShowGrid   = false
     private var lastSnapshot: RenderSnapshot? = null
+    private var currentDocWidth  = 0
+    private var currentDocHeight = 0
 
     // ── GLSurfaceView.Renderer ───────────────────────────────────────────
 
@@ -149,6 +185,10 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         darkenComposite   = GlProgram(Shaders.COMPOSITE_VERT, Shaders.COMPOSITE_FRAG_DARKEN)
         lightenComposite  = GlProgram(Shaders.COMPOSITE_VERT, Shaders.COMPOSITE_FRAG_LIGHTEN)
         gridProgram       = GlProgram(Shaders.LINE_VERT, Shaders.LINE_FRAG)
+        filterHslProg      = GlProgram(Shaders.COMPOSITE_VERT, Shaders.FILTER_HSL_FRAG)
+        filterBlurHProg    = GlProgram(Shaders.COMPOSITE_VERT, Shaders.FILTER_BLUR_H_FRAG)
+        filterBlurVProg    = GlProgram(Shaders.COMPOSITE_VERT, Shaders.FILTER_BLUR_V_FRAG)
+        filterContrastProg = GlProgram(Shaders.COMPOSITE_VERT, Shaders.FILTER_CONTRAST_FRAG)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -166,8 +206,12 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         wetCanvasFbo?.delete();      wetCanvasFbo      = null
         bakingMarksFbo?.delete();    bakingMarksFbo    = null
         compositeCache?.delete();    compositeCache    = null
-        compA?.delete(); compA = LayerFbo(width, height)
-        compB?.delete(); compB = LayerFbo(width, height)
+        filterTempFbo?.delete();  filterTempFbo  = null
+        filterTemp2Fbo?.delete(); filterTemp2Fbo = null
+        val (dw, dh) = effectiveDoc(lastSnapshot)
+        compA?.delete(); compA = LayerFbo(dw, dh)
+        compB?.delete(); compB = LayerFbo(dw, dh)
+        currentDocWidth = dw; currentDocHeight = dh
 
         liveStrokeActiveLayerId = null
         lastLivePointCount      = 0
@@ -179,7 +223,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         lastLiveSize   = -1
         lastLayerOrder = emptyList()
 
-        lastSnapshot?.layers?.let { rebuildAll(it) }
+        lastSnapshot?.let { s -> rebuildAll(s.layers, effectiveDoc(s).first, effectiveDoc(s).second) }
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -205,15 +249,60 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         val w = surfaceWidth; val h = surfaceHeight
         if (w == 0 || h == 0) return
 
-        brushRenderer.setProjection(w.toFloat(), h.toFloat())
+        val (docW, docH) = effectiveDoc(snap)
+        // ドキュメントサイズが変わった場合 (新規キャンバス / インポート) は合成用 FBO を再生成
+        if (docW != currentDocWidth || docH != currentDocHeight) {
+            compositeCache?.delete(); compositeCache = null
+            compA?.delete(); compA = LayerFbo(docW, docH)
+            compB?.delete(); compB = LayerFbo(docW, docH)
+            currentDocWidth = docW; currentDocHeight = docH
+        }
+        // ブラシ投影はドキュメント座標系で設定
+        brushRenderer.setProjection(docW.toFloat(), docH.toFloat())
+
+        // ── Layer pixel uploads (for loading saved canvases / importing images) ──
+        pendingPixelBatch.getAndSet(null)?.let { batch ->
+            val bw = batch.width; val bh = batch.height
+            layerFbos.values.forEach { it.delete() }
+            layerFbos.clear()
+            layerStrokeCounts.clear()
+            layerMeta.clear()
+            for ((layerId, pixels, _) in batch.uploads) {
+                // FBO はドキュメントサイズ (bw×bh) で作成。
+                // 表示時の letterbox は drawCacheToScreen が担うため、ここでストレッチしない。
+                val fbo = LayerFbo(bw, bh)
+                fbo.clear()
+                val texIds = IntArray(1)
+                GLES20.glGenTextures(1, texIds, 0)
+                val texId = texIds[0]
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                val buf = java.nio.ByteBuffer.wrap(pixels)
+                GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, bw, bh, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+                fbo.bind()
+                GLES20.glDisable(GLES20.GL_BLEND)
+                drawTexFlat(normalComposite, texId, -1, 1f, bw, bh)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                GLES20.glDeleteTextures(1, texIds, 0)
+                layerFbos[layerId] = fbo
+                layerStrokeCounts[layerId] = 0
+            }
+            lastLayerOrder = emptyList()
+            compositeCache?.let { buildCompositeCache(snap, docW, docH, it) }
+            batch.onDone()
+        }
 
         watercolorCaptureRequest.getAndSet(null)?.let { (id, cb) ->
             captureLayerPixels(id, cb)
         }
 
-        updateLiveStrokeFbo(snap, w, h)
+        updateLiveStrokeFbo(snap, docW, docH)
 
-        val layerFbosChanged = updateLayerFbos(snap, w, h)
+        val layerFbosChanged = updateLayerFbos(snap, docW, docH)
 
         val liveSize    = snap.currentPoints.size
         val liveChanged = liveSize != lastLiveSize
@@ -221,10 +310,14 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         if (liveChanged) lastLiveSize = liveSize
         if (metaChanged) { lastShowGrid = snap.showGrid; lastActiveId = snap.activeLayerId }
 
-        val contentChanged = layerFbosChanged || liveChanged || metaChanged
+        val filterHash = snap.filterPreview?.hashCode() ?: 0
+        val filterChanged = filterHash != lastFilterHash || snap.filterLayerId != lastFilterLayerId
+        if (filterChanged) { lastFilterHash = filterHash; lastFilterLayerId = snap.filterLayerId }
 
-        val cache = compositeCache ?: LayerFbo(w, h).also { compositeCache = it }
-        if (contentChanged) buildCompositeCache(snap, w, h, cache)
+        val contentChanged = layerFbosChanged || liveChanged || metaChanged || filterChanged
+
+        val cache = compositeCache ?: LayerFbo(docW, docH).also { compositeCache = it }
+        if (contentChanged) buildCompositeCache(snap, docW, docH, cache)
 
         drawCacheToScreen(snap, w, h, cache)
 
@@ -239,14 +332,14 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
             for (id in req.layerIds) {
                 val fbo = layerFbos[id] ?: continue
                 fbo.bind()
-                val bb = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
-                GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
+                val bb = ByteBuffer.allocateDirect(docW * docH * 4).order(ByteOrder.nativeOrder())
+                GLES20.glReadPixels(0, 0, docW, docH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 bb.position(0)
-                val bytes = ByteArray(w * h * 4); bb.get(bytes)
+                val bytes = ByteArray(docW * docH * 4); bb.get(bytes)
                 result.add(Pair(id, bytes))
             }
-            req.callback(result, w, h)
+            req.callback(result, docW, docH)
         }
     }
 
@@ -390,9 +483,9 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         drawTexFlat(normalComposite, snapshot.texId, -1, 1f, w, h)
 
         // Step2: marks をブレンド (プリマルチプライドアルファ)
-        // 筆・水彩筆・エアブラシ・Blur・Marker は compositeAlpha = 1.0 でキャップなし。
-        // Marker は GL_MAX で既存レイヤーのアルファを優先するため、opacity キャップ不要。
         // Pencil のみ opacity でキャップを適用。
+        // Fude / Watercolor は needsWetCanvas のため rebuildLiveFromMarks を通らないが、
+        // 念のため compositeAlpha = 1.0 に戻す (opacity は水分量でコントロール)。
         val compositeAlpha = when (brush.type) {
             BrushType.Pencil -> brush.opacity
             else -> 1.0f
@@ -464,7 +557,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
                 }
             }
 
-            val newMeta = LayerMeta(count, layer.isVisible, layer.opacity, layer.blendMode.ordinal)
+            val newMeta = LayerMeta(count, layer.isVisible, layer.opacity, layer.blendMode.ordinal, layer.filter?.hashCode() ?: 0)
             if (layerMeta[layer.id] != newMeta) {
                 layerMeta[layer.id] = newMeta
                 changed = true
@@ -490,11 +583,12 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
 
     /**
      * ストロークを layerFbo へベイク。
-     * 消しゴム → 直接 layerFbo へ destination-out
-     * 非消しゴム → bakingMarksFbo 経由で opacity を適用してから SrcOver
+     * 消しゴム / ウェットキャンバス系 (Fude / Watercolor / Blur) → 直接 layerFbo へ
+     *   2パス (dest-out + additive) が既存コンテンツを必要とするため layerFbo に直接適用。
+     * 通常ブラシ → bakingMarksFbo 経由で opacity を適用してから SrcOver
      */
     private fun bakeStroke(stroke: Stroke, layerFbo: LayerFbo, w: Int, h: Int) {
-        if (stroke.brush.type == BrushType.Eraser) {
+        if (stroke.brush.type == BrushType.Eraser || stroke.brush.type.needsWetCanvas) {
             layerFbo.bind()
             brushRenderer.renderStroke(stroke)
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -508,8 +602,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
 
         // layerFbo へ合成アルファで SrcOver (Marker は alpha に GL_MAX)
-        // Marker は GL_MAX で既存レイヤーのアルファを優先するため compositeAlpha = 1.0。
-        // Pencil のみ opacity でキャップを適用。
+        // Pencil のみ opacity でキャップを適用。Marker / その他は 1.0。
         val compositeAlpha = when (stroke.brush.type) {
             BrushType.Pencil -> stroke.brush.opacity
             else -> 1.0f
@@ -574,6 +667,13 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
                 layerFbos[layer.id] ?: continue
             }
 
+            // フィルター適用: プレビュー中または適用済みフィルターがある場合
+            val activeFilter: LayerFilter? = when {
+                layer.id == snap.filterLayerId && snap.filterPreview != null -> snap.filterPreview
+                else -> layer.filter
+            }
+            val srcTexId = if (activeFilter != null) applyFilterToTex(fbo.texId, activeFilter, w, h) else fbo.texId
+
             if (layer.blendMode == LayerBlendMode.Normal) {
                 current.bind()
                 GLES20.glEnable(GLES20.GL_BLEND)
@@ -581,12 +681,12 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
                     GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
                     GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
                 )
-                drawTexFlat(normalComposite, fbo.texId, -1, layer.opacity, w, h)
+                drawTexFlat(normalComposite, srcTexId, -1, layer.opacity, w, h)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             } else {
                 swap.clear(); swap.bind()
                 GLES20.glDisable(GLES20.GL_BLEND)
-                drawTexFlat(blendProgFor(layer.blendMode), fbo.texId, current.texId, layer.opacity, w, h)
+                drawTexFlat(blendProgFor(layer.blendMode), srcTexId, current.texId, layer.opacity, w, h)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 val tmp = current; current = swap; swap = tmp
             }
@@ -637,19 +737,28 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         srcTexId: Int,
         alpha: Float,
         snap: RenderSnapshot,
-        w: Int, h: Int,
+        screenW: Int, screenH: Int,
     ) {
-        val cx = w / 2f; val cy = h / 2f
-        val z  = snap.zoom
+        // ドキュメントサイズ (0 = 画面サイズと同じ)
+        val docW = snap.docWidth.takeIf  { it > 0 } ?: screenW
+        val docH = snap.docHeight.takeIf { it > 0 } ?: screenH
+
+        // letterbox スケール: ドキュメントが画面に収まる最大スケール
+        val baseScale = minOf(screenW.toFloat() / docW, screenH.toFloat() / docH)
+        // ユーザーの zoom を合成したスケール
+        val finalScale = baseScale * snap.zoom
+
+        val cx = screenW / 2f; val cy = screenH / 2f
         val cosT = cos(snap.rotation.toDouble()).toFloat()
         val sinT = sin(snap.rotation.toDouble()).toFloat()
-        val hw = w / 2f; val hh = h / 2f
+        // ドキュメントの半サイズ (doc 座標中心を基準にした四隅オフセット)
+        val hw = docW / 2f; val hh = docH / 2f
         val scx = cx + snap.panX; val scy = cy + snap.panY
 
-        val tlX = scx + z * (-hw * cosT + hh * sinT); val tlY = scy + z * (-hw * sinT - hh * cosT)
-        val trX = scx + z * ( hw * cosT + hh * sinT); val trY = scy + z * ( hw * sinT - hh * cosT)
-        val brX = scx + z * ( hw * cosT - hh * sinT); val brY = scy + z * ( hw * sinT + hh * cosT)
-        val blX = scx + z * (-hw * cosT - hh * sinT); val blY = scy + z * (-hw * sinT + hh * cosT)
+        val tlX = scx + finalScale * (-hw * cosT + hh * sinT); val tlY = scy + finalScale * (-hw * sinT - hh * cosT)
+        val trX = scx + finalScale * ( hw * cosT + hh * sinT); val trY = scy + finalScale * ( hw * sinT - hh * cosT)
+        val brX = scx + finalScale * ( hw * cosT - hh * sinT); val brY = scy + finalScale * ( hw * sinT + hh * cosT)
+        val blX = scx + finalScale * (-hw * cosT - hh * sinT); val blY = scy + finalScale * (-hw * sinT + hh * cosT)
 
         val quadVerts = floatArrayOf(
             tlX, tlY,  0f, 1f,
@@ -659,7 +768,7 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
             brX, brY,  1f, 0f,
             blX, blY,  0f, 0f,
         )
-        val mvp = FloatArray(16); ortho(mvp, 0f, w.toFloat(), h.toFloat(), 0f)
+        val mvp = FloatArray(16); ortho(mvp, 0f, screenW.toFloat(), screenH.toFloat(), 0f)
         drawTexWithMvp(prog, quadVerts, mvp, srcTexId, -1, alpha)
     }
 
@@ -736,14 +845,16 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
             wetCanvasFbo!!
         else
             layerFbos[layerId] ?: return
-        val w = surfaceWidth; val h = surfaceHeight
+        // ドキュメントサイズで読み取る (画面サイズではない)
+        val dw = currentDocWidth.takeIf { it > 0 } ?: surfaceWidth
+        val dh = currentDocHeight.takeIf { it > 0 } ?: surfaceHeight
         fbo.bind()
-        val bb = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
-        GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
+        val bb = ByteBuffer.allocateDirect(dw * dh * 4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(0, 0, dw, dh, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         bb.position(0)
-        val bytes = ByteArray(w * h * 4); bb.get(bytes)
-        callback(bytes, w, h)
+        val bytes = ByteArray(dw * dh * 4); bb.get(bytes)
+        callback(bytes, dw, dh)
     }
 
     fun requestWatercolorCapture(layerId: String, cb: (ByteArray, Int, Int) -> Unit) {
@@ -754,15 +865,16 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
 
     fun captureCompositePixels(callback: (ByteArray, Int, Int) -> Unit) {
         val cache = compositeCache ?: return
-        val w = surfaceWidth; val h = surfaceHeight
-        if (w == 0 || h == 0) return
+        val dw = currentDocWidth.takeIf { it > 0 } ?: surfaceWidth
+        val dh = currentDocHeight.takeIf { it > 0 } ?: surfaceHeight
+        if (dw == 0 || dh == 0) return
         cache.bind()
-        val bb = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
-        GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
+        val bb = ByteBuffer.allocateDirect(dw * dh * 4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(0, 0, dw, dh, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, bb)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         bb.position(0)
-        val bytes = ByteArray(w * h * 4); bb.get(bytes)
-        callback(bytes, w, h)
+        val bytes = ByteArray(dw * dh * 4); bb.get(bytes)
+        callback(bytes, dw, dh)
     }
 
     fun requestCompositeCapture(cb: (ByteArray, Int, Int) -> Unit) {
@@ -780,14 +892,19 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
 
     // ── ユーティリティ ───────────────────────────────────────────────────
 
-    private fun rebuildAll(layers: List<PaintLayer>) {
-        val w = surfaceWidth; val h = surfaceHeight
-        if (w == 0 || h == 0) return
-        brushRenderer.setProjection(w.toFloat(), h.toFloat())
+    private fun effectiveDoc(snap: RenderSnapshot?): Pair<Int, Int> {
+        val dw = snap?.docWidth?.takeIf  { it > 0 } ?: surfaceWidth
+        val dh = snap?.docHeight?.takeIf { it > 0 } ?: surfaceHeight
+        return Pair(dw, dh)
+    }
+
+    private fun rebuildAll(layers: List<PaintLayer>, docW: Int = surfaceWidth, docH: Int = surfaceHeight) {
+        if (docW == 0 || docH == 0) return
+        brushRenderer.setProjection(docW.toFloat(), docH.toFloat())
         for (layer in layers) {
             if (layer.strokes.isEmpty()) continue
-            val fbo = LayerFbo(w, h).also { it.clear() }
-            for (stroke in layer.strokes) bakeStroke(stroke, fbo, w, h)
+            val fbo = LayerFbo(docW, docH).also { it.clear() }
+            for (stroke in layer.strokes) bakeStroke(stroke, fbo, docW, docH)
             layerFbos[layer.id] = fbo
             layerStrokeCounts[layer.id] = layer.strokes.size
         }
@@ -802,6 +919,91 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         else                    -> normalComposite
     }
 
+    // ── フィルター適用 ────────────────────────────────────────────────────
+
+    /**
+     * フィルターをテクスチャに適用し、結果のテクスチャ ID を返す。
+     * filterTempFbo に結果を書き込む (2パスブラーは filterTemp2Fbo も使用)。
+     */
+    private fun applyFilterToTex(srcTexId: Int, filter: LayerFilter, w: Int, h: Int): Int {
+        val temp = filterTempFbo ?: LayerFbo(w, h).also { filterTempFbo = it }
+        return when (filter.type) {
+            FilterType.HSL -> {
+                temp.bind(); GLES20.glDisable(GLES20.GL_BLEND)
+                drawFilterQuad(filterHslProg, srcTexId, w, h) { prog ->
+                    GLES20.glUniform1f(prog.uniform("uHue"), filter.hue)
+                    GLES20.glUniform1f(prog.uniform("uSat"), filter.saturation)
+                    GLES20.glUniform1f(prog.uniform("uLit"), filter.lightness)
+                }
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                temp.texId
+            }
+            FilterType.BLUR -> {
+                if (filter.blurRadius < 0.001f) return srcTexId
+                val radius = filter.blurRadius * 40f  // 0..40px
+                val temp2 = filterTemp2Fbo ?: LayerFbo(w, h).also { filterTemp2Fbo = it }
+                // 水平パス: src → temp2
+                temp2.bind(); GLES20.glDisable(GLES20.GL_BLEND)
+                drawFilterQuad(filterBlurHProg, srcTexId, w, h) { prog ->
+                    GLES20.glUniform1f(prog.uniform("uRadius"), radius)
+                    GLES20.glUniform2f(prog.uniform("uTexelSize"), 1f / w, 1f / h)
+                }
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                // 垂直パス: temp2 → temp
+                temp.bind(); GLES20.glDisable(GLES20.GL_BLEND)
+                drawFilterQuad(filterBlurVProg, temp2.texId, w, h) { prog ->
+                    GLES20.glUniform1f(prog.uniform("uRadius"), radius)
+                    GLES20.glUniform2f(prog.uniform("uTexelSize"), 1f / w, 1f / h)
+                }
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                temp.texId
+            }
+            FilterType.CONTRAST -> {
+                temp.bind(); GLES20.glDisable(GLES20.GL_BLEND)
+                drawFilterQuad(filterContrastProg, srcTexId, w, h) { prog ->
+                    GLES20.glUniform1f(prog.uniform("uContrast"),   filter.contrast)
+                    GLES20.glUniform1f(prog.uniform("uBrightness"), filter.brightness)
+                }
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                temp.texId
+            }
+        }
+    }
+
+    /** フルスクリーン quad にフィルターシェーダーを適用する汎用ヘルパー。 */
+    private fun drawFilterQuad(
+        prog: GlProgram,
+        srcTexId: Int,
+        w: Int, h: Int,
+        setUniforms: (GlProgram) -> Unit,
+    ) {
+        val wf = w.toFloat(); val hf = h.toFloat()
+        val quadVerts = floatArrayOf(
+            0f,  0f,  0f, 1f,
+            wf,  0f,  1f, 1f,
+            wf,  hf,  1f, 0f,
+            0f,  0f,  0f, 1f,
+            wf,  hf,  1f, 0f,
+            0f,  hf,  0f, 0f,
+        )
+        val mvp = FloatArray(16); ortho(mvp, 0f, wf, hf, 0f)
+        val buf = quadVerts.toFB()
+        prog.use()
+        GLES20.glUniformMatrix4fv(prog.uniform("uMVP"), 1, false, mvp, 0)
+        GLES20.glUniform1f(prog.uniform("uAlpha"), 1f)
+        GLES20.glUniform1i(prog.uniform("uTex"), 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTexId)
+        setUniforms(prog)
+        val posLoc = prog.attrib("aPos"); val uvLoc = prog.attrib("aUV")
+        GLES20.glEnableVertexAttribArray(posLoc); GLES20.glEnableVertexAttribArray(uvLoc)
+        buf.position(0); GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, buf)
+        buf.position(2); GLES20.glVertexAttribPointer(uvLoc,  2, GLES20.GL_FLOAT, false, 16, buf)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
+        GLES20.glDisableVertexAttribArray(posLoc); GLES20.glDisableVertexAttribArray(uvLoc)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+    }
+
     fun cleanup() {
         layerFbos.values.forEach { it.delete() }; layerFbos.clear()
         strokeSnapshotFbo?.delete()
@@ -811,9 +1013,13 @@ internal class CanvasGlRenderer : GLSurfaceView.Renderer {
         bakingMarksFbo?.delete()
         compositeCache?.delete()
         compA?.delete(); compB?.delete()
+        filterTempFbo?.delete()
+        filterTemp2Fbo?.delete()
         brushRenderer.delete()
         listOf(normalComposite, multiplyComposite, screenComposite,
                overlayComposite, darkenComposite, lightenComposite,
-               gridProgram).forEach { it.delete() }
+               gridProgram,
+               filterHslProg, filterBlurHProg, filterBlurVProg, filterContrastProg,
+               ).forEach { it.delete() }
     }
 }
