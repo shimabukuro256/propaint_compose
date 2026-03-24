@@ -1,949 +1,936 @@
 package com.propaint.app.viewmodel
 
-import android.app.Application
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.geometry.Offset
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
+import android.view.MotionEvent
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.lerp
-import androidx.lifecycle.AndroidViewModel
-import com.propaint.app.gl.PsdExporter
-import com.propaint.app.gl.PsdLayerData
-import com.propaint.app.io.CanvasData
-import com.propaint.app.model.*
-import java.io.File
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.propaint.app.engine.*
+import com.propaint.app.gl.CanvasRenderer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.io.InputStream
 import java.io.OutputStream
-import kotlin.math.pow
-import kotlin.math.sqrt
+import kotlin.math.*
 
-class PaintViewModel(application: Application) : AndroidViewModel(application) {
+data class UiLayer(
+    val id: Int, val name: String, val opacity: Float, val blendMode: Int,
+    val isVisible: Boolean, val isLocked: Boolean,
+    val isClipToBelow: Boolean, val isActive: Boolean,
+)
 
-    private val historyCache = HistoryDiskCache(File(application.cacheDir, "paint_history"))
+enum class BrushType(val displayName: String) {
+    Pencil("鉛筆"), BinaryPen("バイナリ"), Fude("筆"), Watercolor("水彩筆"), Airbrush("エアブラシ"),
+    Marker("マーカー"), Eraser("消しゴム"), Blur("ぼかし"), Fill("塗潰し"),
+}
 
-    // ── Brush ──
-    var brushSettings by mutableStateOf(BrushSettings())
-        private set
-    var currentColor by mutableStateOf(Color.Black)
-        private set
-    val colorHistory = mutableStateListOf(
+enum class ToolMode {
+    Draw, Eyedropper,
+    SelectRect, SelectAuto, SelectPen, SelectEraser,
+}
+
+class PaintViewModel : ViewModel() {
+
+    private var _document: CanvasDocument? = null
+    val document: CanvasDocument? get() = _document
+    val renderer = CanvasRenderer()
+    private var appContext: Context? = null
+    private var autoSaveJob: Job? = null
+    private var autoSaveDirty = false
+
+    // ── UI State ────────────────────────────────────────────────────
+
+    private val _layers = MutableStateFlow<List<UiLayer>>(emptyList())
+    val layers: StateFlow<List<UiLayer>> = _layers.asStateFlow()
+
+    private val _brushType = MutableStateFlow(BrushType.Pencil)
+    val currentBrushType: StateFlow<BrushType> = _brushType.asStateFlow()
+
+    private val _toolMode = MutableStateFlow(ToolMode.Draw)
+    val toolMode: StateFlow<ToolMode> = _toolMode.asStateFlow()
+
+    private val _brushSize = MutableStateFlow(6f)
+    val brushSize: StateFlow<Float> = _brushSize.asStateFlow()
+    private val _brushOpacity = MutableStateFlow(1f)
+    val brushOpacity: StateFlow<Float> = _brushOpacity.asStateFlow()
+    private val _brushHardness = MutableStateFlow(1f)
+    val brushHardness: StateFlow<Float> = _brushHardness.asStateFlow()
+    private val _brushDensity = MutableStateFlow(1f)
+    val brushDensity: StateFlow<Float> = _brushDensity.asStateFlow()
+    private val _brushSpacing = MutableStateFlow(0.15f)
+    val brushSpacing: StateFlow<Float> = _brushSpacing.asStateFlow()
+    private val _brushStabilizer = MutableStateFlow(0.3f)
+    val brushStabilizer: StateFlow<Float> = _brushStabilizer.asStateFlow()
+    private val _colorStretch = MutableStateFlow(0.5f)
+    val colorStretch: StateFlow<Float> = _colorStretch.asStateFlow()
+    private val _waterContent = MutableStateFlow(0f)
+    val waterContent: StateFlow<Float> = _waterContent.asStateFlow()
+    private val _blurStrength = MutableStateFlow(0.5f)
+    val blurStrength: StateFlow<Float> = _blurStrength.asStateFlow()
+    private val _pressureSizeEnabled = MutableStateFlow(true)
+    val pressureSizeEnabled: StateFlow<Boolean> = _pressureSizeEnabled.asStateFlow()
+    private val _pressureOpacityEnabled = MutableStateFlow(false)
+    val pressureOpacityEnabled: StateFlow<Boolean> = _pressureOpacityEnabled.asStateFlow()
+    private val _pressureSmudgeEnabled = MutableStateFlow(false)
+    val pressureSmudgeEnabled: StateFlow<Boolean> = _pressureSmudgeEnabled.asStateFlow()
+    private val _filterPressureThreshold = MutableStateFlow(0.3f)
+    val filterPressureThreshold: StateFlow<Float> = _filterPressureThreshold.asStateFlow()
+    private val _fillTolerance = MutableStateFlow(32f)
+    val fillTolerance: StateFlow<Float> = _fillTolerance.asStateFlow()
+
+    // ── 選択 ──
+    private val _hasSelection = MutableStateFlow(false)
+    val hasSelection: StateFlow<Boolean> = _hasSelection.asStateFlow()
+    private val _selectionTolerance = MutableStateFlow(32f)
+    val selectionTolerance: StateFlow<Float> = _selectionTolerance.asStateFlow()
+    private val _selectionAddMode = MutableStateFlow(false)
+    val selectionAddMode: StateFlow<Boolean> = _selectionAddMode.asStateFlow()
+
+    // 矩形選択ドラッグ状態
+    private var rectSelStartX = 0f
+    private var rectSelStartY = 0f
+
+    private val _currentColor = MutableStateFlow(Color.Black)
+    val currentColor: StateFlow<Color> = _currentColor.asStateFlow()
+    val colorHistory = MutableStateFlow(listOf(
         Color.Black, Color.White, Color.Red, Color.Blue,
         Color.Green, Color.Yellow, Color(0xFFFF6600), Color(0xFF9900FF),
+        Color(0xFF00CCCC), Color(0xFFFF69B4), Color(0xFF8B4513), Color(0xFF808080),
+    ))
+
+    private val _canUndo = MutableStateFlow(false)
+    val canUndo: StateFlow<Boolean> = _canUndo.asStateFlow()
+    private val _canRedo = MutableStateFlow(false)
+    val canRedo: StateFlow<Boolean> = _canRedo.asStateFlow()
+    private val _isDrawing = MutableStateFlow(false)
+    val isDrawing: StateFlow<Boolean> = _isDrawing.asStateFlow()
+
+    // View transform
+    private var _zoom = 1f; private var _panX = 0f; private var _panY = 0f; private var _rotation = 0f
+    private var gestureStartDist = 0f; private var gestureStartZoom = 1f
+    private var gestureStartAngle = 0f; private var gestureStartRotation = 0f
+    private var gestureStartPanX = 0f; private var gestureStartPanY = 0f
+    private var gestureStartMidX = 0f; private var gestureStartMidY = 0f
+    private var isMultiTouch = false
+    // Gesture tap detection (2-finger tap → undo, 3-finger tap → redo)
+    private var gestureTotalMovement = 0f
+    private var gestureMaxPointers = 0
+    private var gestureStartTime = 0L
+    // Long-press eyedropper (hold 500ms without moving → sample color)
+    private var longPressJob: Job? = null
+    private var longPressStartX = 0f
+    private var longPressStartY = 0f
+
+    // ブラシ設定マップ (種別ごとに全パラメータ保持)
+    data class BrushState(
+        val size: Float, val opacity: Float, val hardness: Float,
+        val density: Float, val spacing: Float, val stabilizer: Float,
+        val colorStretch: Float, val waterContent: Float, val blurStrength: Float,
+        val pressureSize: Boolean, val pressureOpacity: Boolean,
+        val pressureSmudge: Boolean,
+        val filterPressureThreshold: Float = 0.3f,
     )
+    private val brushStateMap = HashMap<BrushType, BrushState>()
 
-    private val brushSettingsMap = HashMap<BrushType, BrushSettings>()
+    // ── 初期化 ──────────────────────────────────────────────────────
 
-    // ── Layers ──
-    val layers = mutableStateListOf(PaintLayer(name = "レイヤー 1"))
-    var activeLayerId by mutableStateOf(layers.first().id)
-        private set
-
-    val activeLayer: PaintLayer?
-        get() = layers.find { it.id == activeLayerId }
-
-    // ── Drawing state ──
-    private val _currentStrokePoints = ArrayList<StrokePoint>(256)
-    val currentStrokePoints: List<StrokePoint> get() = _currentStrokePoints
-    var strokeVersion by mutableIntStateOf(0)
-        private set
-    var isDrawing by mutableStateOf(false)
-        private set
-
-    // ── Eyedropper ──
-    var isEyedropperActive by mutableStateOf(false)
-        private set
-
-    // ── Canvas identity ──
-    var canvasId by mutableStateOf(java.util.UUID.randomUUID().toString())
-        private set
-    var canvasTitle by mutableStateOf("無題")
-        private set
-    var canvasDocWidth by mutableIntStateOf(0)
-        private set
-    var canvasDocHeight by mutableIntStateOf(0)
-        private set
-
-    // ── Export request ──
-    enum class ExportType { PNG, JPEG, WEBP, PSD, PPAINT }
-    var exportRequest: ExportType? by mutableStateOf(null)
-        private set
-
-    // ── Auto-save (ギャラリーへ戻る前にトリガー) ──
-    var saveCanvasRequest by mutableIntStateOf(0)
-        private set
-    fun requestSaveCanvas() { saveCanvasRequest++ }
-
-    // ── Layer pixel upload (for loading saved canvases) ──
-    var pendingPixelUploads: List<Pair<String, ByteArray>>? = null
-        private set
-    var pendingPixelWidth = 0
-        private set
-    var pendingPixelHeight = 0
-        private set
-    var pixelUploadVersion by mutableIntStateOf(0)
-        private set
-
-    // ── Filter preview ──
-    var filterPreview: LayerFilter? by mutableStateOf(null)
-        private set
-
-    // ── Canvas pixel capture (for Fude / Watercolor / Marker / Blur) ──
-    private var capturedPixels: ByteArray? = null
-    private var capturedW: Int = 0
-    private var capturedH: Int = 0
-
-    // ── 走行インク (Fude / Watercolor / Marker) ──
-    // ストローク開始時に null にリセット。ストローク内でキャンバス色を吸収しながら進化する。
-    private var strokeInkColor: Color? = null
-
-    // ── 混色サンプリングスロットル (Fude / Watercolor / Blur) ──
-    // spacing=1 等の過密スタンプでも直前の自分のピクセルを読み返すフィードバックを防ぐ。
-    // ブラシ直径に比例した距離ごとのみサンプリングを更新し、中間はキャッシュを返す。
-    private var lastMixPosition: Offset? = null
-    private var lastMixColor: Color? = null
-
-    // ── ストローク方向追跡 (折り返し検出) ──
-    private var lastMoveDir: Offset = Offset.Zero
-
-    fun setPixelCapture(pixels: ByteArray, w: Int, h: Int) {
-        capturedPixels = pixels; capturedW = w; capturedH = h
+    /** Context を設定 (自動保存に必要) */
+    fun setAppContext(context: Context) {
+        appContext = context.applicationContext
     }
 
-    fun clearPixelCapture() { capturedPixels = null }
-
-    // ── Canvas view ──
-    data class ViewTransform(
-        val zoom: Float = 1f,
-        val panX: Float = 0f,
-        val panY: Float = 0f,
-        val rotation: Float = 0f,
-    )
-    var viewTransform by mutableStateOf(ViewTransform())
-        private set
-    val zoom: Float get() = viewTransform.zoom
-    val panOffset: Offset get() = Offset(viewTransform.panX, viewTransform.panY)
-    val rotation: Float get() = viewTransform.rotation
-
-    // ── Options ──
-    var showGrid by mutableStateOf(false)
-        private set
-    var symmetryEnabled by mutableStateOf(false)
-        private set
-
-    // ── History ──
-    private val undoStack = HybridHistoryStack(historyCache, maxMemory = 10, maxTotal = 50)
-    private val redoStack = HybridHistoryStack(
-        HistoryDiskCache(File(getApplication<Application>().cacheDir, "paint_history_redo")),
-        maxMemory = 10, maxTotal = 50,
-    )
-
-    val canUndo get() = undoStack.isNotEmpty
-    val canRedo get() = redoStack.isNotEmpty
-
-    // ── Brush ──
-
-    fun setBrush(settings: BrushSettings) {
-        brushSettings = settings
-        brushSettingsMap[settings.type] = settings
+    fun initCanvas(width: Int, height: Int) {
+        val doc = CanvasDocument(width, height)
+        _document = doc; renderer.document = doc; updateLayerState()
+        startAutoSave()
     }
 
-    fun selectBrushType(type: BrushType) {
-        brushSettingsMap[brushSettings.type] = brushSettings
-        brushSettings = brushSettingsMap[type] ?: BrushSettings(type = type)
+    /** 既存の CanvasDocument を直接ロード (プロジェクトから開く場合) */
+    fun loadDocument(doc: CanvasDocument) {
+        _document = doc; renderer.document = doc; updateLayerState(); updateUndoState()
+        startAutoSave()
     }
 
-    fun setBrushSize(size: Float) { setBrush(brushSettings.copy(size = size.coerceIn(1f, 2000f))) }
-    fun setBrushOpacity(opacity: Float) { setBrush(brushSettings.copy(opacity = opacity.coerceIn(0.01f, 1f))) }
-    fun setBrushDensity(density: Float) { setBrush(brushSettings.copy(density = density.coerceIn(0.01f, 1f))) }
-    fun setBrushSpacing(spacing: Float) { setBrush(brushSettings.copy(spacing = spacing.coerceIn(0.01f, 2.0f))) }
-    fun setBrushHardness(hardness: Float) { setBrush(brushSettings.copy(hardness = hardness.coerceIn(0f, 1f))) }
-    fun setBrushStabilizer(stabilizer: Float) { setBrush(brushSettings.copy(stabilizer = stabilizer.coerceIn(0f, 1f))) }
-    fun setBrushBlurStrength(v: Float) { setBrush(brushSettings.copy(blurStrength = v.coerceIn(0.05f, 1f))) }
-    fun setBrushColorStretch(v: Float) { setBrush(brushSettings.copy(colorStretch = v.coerceIn(0f, 1f))) }
-    fun togglePressureSize() { setBrush(brushSettings.copy(pressureSizeEnabled = !brushSettings.pressureSizeEnabled)) }
-    fun togglePressureOpacity() { setBrush(brushSettings.copy(pressureOpacityEnabled = !brushSettings.pressureOpacityEnabled)) }
-    fun setPressureSizeIntensity(v: Int) { setBrush(brushSettings.copy(pressureSizeIntensity = v.coerceIn(1, 200))) }
-    fun setPressureOpacityIntensity(v: Int) { setBrush(brushSettings.copy(pressureOpacityIntensity = v.coerceIn(1, 200))) }
-    fun togglePressureMix() { setBrush(brushSettings.copy(pressureMixEnabled = !brushSettings.pressureMixEnabled)) }
-    fun setPressureMixIntensity(v: Int) { setBrush(brushSettings.copy(pressureMixIntensity = v.coerceIn(1, 200))) }
-    fun setBrushWaterContent(v: Float) { setBrush(brushSettings.copy(waterContent = v.coerceIn(0f, 1f))) }
-    fun setBrushWatercolorBlurStrength(v: Int) { setBrush(brushSettings.copy(watercolorBlurStrength = v.coerceIn(1, 100))) }
-    fun setBrushAntiAliasing(v: Float) { setBrush(brushSettings.copy(antiAliasing = v.coerceIn(0f, 4f))) }
+    /** クラッシュ復旧データがあるか確認 */
+    fun hasRecoveryData(): Boolean = appContext?.let { AutoSaveManager.hasRecoveryData(it) } ?: false
 
-    // ── Color ──
+    /** クラッシュ復旧データのタイムスタンプ */
+    fun getRecoveryTimestamp(): Long = appContext?.let { AutoSaveManager.getRecoveryTimestamp(it) } ?: 0
 
-    fun setColor(color: Color) {
-        currentColor = color
-        if (color !in colorHistory) {
-            colorHistory.add(0, color)
-            if (colorHistory.size > 20) colorHistory.removeAt(colorHistory.lastIndex)
-        }
-    }
-
-    // ── Eyedropper ──
-
-    fun activateEyedropper() { isEyedropperActive = true }
-    fun deactivateEyedropper() { isEyedropperActive = false }
-
-    fun requestExport(type: ExportType) { exportRequest = type }
-    fun clearExportRequest() { exportRequest = null }
-
-    // Keep backward compat for callers still using requestPsdExport
-    fun requestPsdExport() { requestExport(ExportType.PSD) }
-
-    // Called when loading a saved canvas
-    fun loadFromCanvasData(data: CanvasData) {
-        layers.clear()
-        layers.addAll(data.layers)
-        activeLayerId = data.activeLayerId
-        canvasId = data.id
-        canvasTitle = data.title
-        canvasDocWidth  = data.width
-        canvasDocHeight = data.height
-        undoStack.clear()
-        redoStack.clear()
-        filterPreview = null
-        pendingPixelUploads = data.layerPixels
-        pendingPixelWidth   = data.width
-        pendingPixelHeight  = data.height
-        pixelUploadVersion++
-        strokeVersion++
-    }
-
-    // Called when creating a new empty canvas
-    fun newCanvas(title: String = "無題") {
-        layers.clear()
-        layers.add(PaintLayer(name = "レイヤー 1"))
-        activeLayerId = layers.first().id
-        canvasId = java.util.UUID.randomUUID().toString()
-        canvasTitle = title
-        canvasDocWidth = 0
-        canvasDocHeight = 0
-        undoStack.clear()
-        redoStack.clear()
-        filterPreview = null
-        pendingPixelUploads = null
-        pixelUploadVersion++
-        strokeVersion++
-    }
-
-    fun setCanvasTitleDirectly(title: String) { canvasTitle = title }
-
-    /**
-     * 外部からインポートした Bitmap を新規キャンバスとして読み込む。
-     * pixels は GL 座標系 (y=0 が下端、プリマルチプライドなし) に変換して渡す。
-     */
-    fun importBitmap(bitmap: android.graphics.Bitmap, title: String) {
-        val w = bitmap.width
-        val h = bitmap.height
-        val src = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
-        // Android ARGB → GL RGBA (y-flip, straight alpha)
-        val bytes = ByteArray(w * h * 4)
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val px  = src[y * w + x]
-                val glY = h - 1 - y
-                val off = (glY * w + x) * 4
-                bytes[off    ] = ((px shr 16) and 0xFF).toByte()
-                bytes[off + 1] = ((px shr  8) and 0xFF).toByte()
-                bytes[off + 2] = (px and 0xFF).toByte()
-                bytes[off + 3] = ((px shr 24) and 0xFF).toByte()
+    /** 復旧データからキャンバスを復元 */
+    fun recoverCanvas() {
+        val ctx = appContext ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isBusy.value = true
+            try {
+                val doc = AutoSaveManager.recover(ctx)
+                if (doc != null) {
+                    _document = doc
+                    renderer.document = doc
+                    _statusMessage.value = "キャンバスを復旧しました"
+                    launch(Dispatchers.Main) { updateLayerState(); updateUndoState() }
+                    startAutoSave()
+                } else {
+                    _statusMessage.value = "復旧に失敗しました"
+                }
+            } catch (e: Exception) {
+                _statusMessage.value = "復旧エラー: ${e.message}"
+            } finally {
+                _isBusy.value = false
             }
         }
-        layers.clear()
-        val newLayer = PaintLayer(name = "レイヤー 1")
-        layers.add(newLayer)
-        activeLayerId      = newLayer.id
-        canvasId           = java.util.UUID.randomUUID().toString()
-        canvasTitle        = title
-        canvasDocWidth     = w
-        canvasDocHeight    = h
-        undoStack.clear()
-        redoStack.clear()
-        filterPreview      = null
-        pendingPixelUploads  = listOf(Pair(newLayer.id, bytes))
-        pendingPixelWidth    = w
-        pendingPixelHeight   = h
-        pixelUploadVersion++
-        strokeVersion++
     }
 
-    // Called after pixels are uploaded, to acknowledge completion
-    fun clearPendingPixelUploads() {
-        pendingPixelUploads = null
+    /** 復旧データを破棄 */
+    fun discardRecovery() {
+        appContext?.let { AutoSaveManager.clearRecoveryData(it) }
     }
 
-    // ── Filter ──
+    // ── 自動保存 + メモリ監視 ────────────────────────────────────────
 
-    @JvmName("updateFilterPreview")
-    fun setFilterPreview(filter: LayerFilter?) { filterPreview = filter }
-
-    fun applyFilter() {
-        val filter = filterPreview ?: return
-        val layerId = activeLayerId
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx < 0) return
-        val prev = layers[idx].filter
-        layers[idx] = layers[idx].copy(filter = filter)
-        pushUndo(CanvasAction.SetLayerFilter(layerId, filter, prev))
-        filterPreview = null
-    }
-
-    fun cancelFilter() { filterPreview = null }
-
-    /**
-     * キャプチャされたコンポジットピクセルから色をサンプリングしてカレントカラーに設定する。
-     * pixels: GL 座標系 RGBA バイト列 (y=0 が下端、プリマルチプライド)。
-     */
-    fun pickColorFromPixels(pixels: ByteArray, x: Int, y: Int, w: Int, h: Int) {
-        val px = x.coerceIn(0, w - 1)
-        val py = (h - 1 - y).coerceIn(0, h - 1)  // GL座標 → 画面座標変換
-        val off = (py * w + px) * 4
-        if (off + 3 >= pixels.size) return
-        val a = (pixels[off + 3].toInt() and 0xFF) / 255f
-        val color = if (a < 0.001f) {
-            Color.White  // 透明ピクセルは白
-        } else {
-            val invA = 1f / a
-            Color(
-                red   = ((pixels[off    ].toInt() and 0xFF) / 255f * invA).coerceIn(0f, 1f),
-                green = ((pixels[off + 1].toInt() and 0xFF) / 255f * invA).coerceIn(0f, 1f),
-                blue  = ((pixels[off + 2].toInt() and 0xFF) / 255f * invA).coerceIn(0f, 1f),
-                alpha = 1f,
-            )
+    private fun startAutoSave() {
+        autoSaveJob?.cancel()
+        autoSaveJob = viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(30_000) // 30秒ごと
+                if (autoSaveDirty) {
+                    performAutoSave()
+                    autoSaveDirty = false
+                }
+            }
         }
-        setColor(color)
     }
 
-    // ── Pixel sampling helpers ──
+    /** 手動で自動保存をトリガー (ライフサイクルイベント時) */
+    fun triggerAutoSave() {
+        val doc = _document ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            appContext?.let { AutoSaveManager.save(it, doc) }
+        }
+    }
 
-    /**
-     * キャンバス座標 (Y上向き=画面上端) から GL ピクセルバッファをサンプル。
-     * FBO はプリマルチプライド RGBA で格納されているためアンプリマルチプライドして返す。
-     * 透明ピクセル (alpha≈0) は色情報がないため null を返す。
-     */
-    private fun samplePixelAt(position: Offset): Color? {
-        val pixels = capturedPixels ?: return null
-        val w = capturedW; val h = capturedH
-        val px = position.x.toInt().coerceIn(0, w - 1)
-        val py = (h - 1 - position.y.toInt()).coerceIn(0, h - 1)
-        val off = (py * w + px) * 4
-        val a = (pixels[off + 3].toInt() and 0xFF) / 255f
-        if (a < 0.001f) return null  // 透明ピクセルは色情報なし
-        val invA = 1f / a
-        return Color(
-            red   = ((pixels[off    ].toInt() and 0xFF) / 255f * invA).coerceIn(0f, 1f),
-            green = ((pixels[off + 1].toInt() and 0xFF) / 255f * invA).coerceIn(0f, 1f),
-            blue  = ((pixels[off + 2].toInt() and 0xFF) / 255f * invA).coerceIn(0f, 1f),
-            alpha = a,
+    /** プロジェクトファイルに保存 */
+    fun saveToProject(context: Context, projectId: String) {
+        val doc = _document ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            CanvasProjectManager.saveProject(context, projectId, doc)
+        }
+    }
+
+    private fun performAutoSave() {
+        val doc = _document ?: return
+        val ctx = appContext ?: return
+        AutoSaveManager.save(ctx, doc)
+    }
+
+    /** ストローク終了後にメモリチェック + auto-save ダーティフラグ設定 */
+    private fun onStrokeEnd() {
+        autoSaveDirty = true
+        val doc = _document ?: return
+        // メモリ監視: 圧迫時に undo スタックを縮小
+        viewModelScope.launch(Dispatchers.Default) {
+            if (MemoryWatcher.checkAndTrim(doc)) {
+                launch(Dispatchers.Main) { updateUndoState() }
+                // 危機的な場合は即座に auto-save
+                val state = MemoryWatcher.getMemoryState()
+                if (state.usageRatio > 0.80) {
+                    performAutoSave()
+                }
+            }
+        }
+    }
+
+    // ── ブラシ操作 ──────────────────────────────────────────────────
+
+    fun setBrushType(type: BrushType) {
+        // 現在の設定を保存
+        brushStateMap[_brushType.value] = BrushState(
+            _brushSize.value, _brushOpacity.value, _brushHardness.value,
+            _brushDensity.value, _brushSpacing.value, _brushStabilizer.value,
+            _colorStretch.value, _waterContent.value, _blurStrength.value,
+            _pressureSizeEnabled.value, _pressureOpacityEnabled.value,
+            _pressureSmudgeEnabled.value, _filterPressureThreshold.value,
         )
+        _brushType.value = type
+        // 保存済みから復元、なければデフォルト
+        val saved = brushStateMap[type]
+        if (saved != null) {
+            _brushSize.value = saved.size; _brushOpacity.value = saved.opacity
+            _brushHardness.value = saved.hardness; _brushDensity.value = saved.density
+            _brushSpacing.value = saved.spacing; _brushStabilizer.value = saved.stabilizer
+            _colorStretch.value = saved.colorStretch; _waterContent.value = saved.waterContent
+            _blurStrength.value = saved.blurStrength
+            _pressureSizeEnabled.value = saved.pressureSize
+            _pressureOpacityEnabled.value = saved.pressureOpacity
+            _pressureSmudgeEnabled.value = saved.pressureSmudge
+            _filterPressureThreshold.value = saved.filterPressureThreshold
+        } else applyDefaults(type)
     }
 
     /**
-     * 重み付きブラー: position 周辺 radius px を距離重み (線形コーン) でサンプリングする。
+     * ブラシ種別ごとの初期値。
      *
-     * 仕様書 Step 1 — サンプリング (周囲の色を拾う):
-     *   カーソルの中心に近いほど強く、外側ほど弱く色を拾うことで境界を自然にぼかす。
-     *
-     * weight(d) = max(0,  1 − d / radius)   ← 中心=1.0, 境界=0.0 の円錐フィルタ
-     *
-     * ピクセルバッファはプリマルチプライド RGBA。重み付き和を取った後にアンプリマルチプライドで返す。
-     * 有効な重み合計が極小 or 全ピクセルが透明な場合は null を返す。
+     * 方針:
+     *  - エアブラシ以外: 硬さ=最大(1.0)
+     *  - 濃度=1.0, 不透明度=1.0, 間隔=0.15
+     *  - 鉛筆: サイズ筆圧ON, 不透明度筆圧OFF
+     *  - 筆/水彩筆: サイズ筆圧OFF, 混色筆圧ON, Direct モード
+     *  - エアブラシ: 硬さ=0(ソフト), 不透明度筆圧ON
      */
-    private fun sampleWeightedBlurAt(position: Offset, radius: Int): Color? {
-        val pixels = capturedPixels ?: return null
-        val w = capturedW; val h = capturedH
-        var rSum = 0f; var gSum = 0f; var bSum = 0f; var aSum = 0f; var wSum = 0f
-        val cx = position.x; val cy = position.y
-        val rF = radius.toFloat()
-        for (sy in (cy.toInt() - radius)..(cy.toInt() + radius)) {
-            for (sx in (cx.toInt() - radius)..(cx.toInt() + radius)) {
-                val dx = sx - cx; val dy = sy - cy
-                val dist = sqrt(dx * dx + dy * dy)
-                if (dist > rF) continue                          // 円形カーネル
-                val weight = 1f - dist / rF                      // 線形コーン重み
-                val px = sx.coerceIn(0, w - 1)
-                val py = (h - 1 - sy).coerceIn(0, h - 1)        // GL Y 反転
-                val off = (py * w + px) * 4
-                rSum += (pixels[off    ].toInt() and 0xFF) / 255f * weight
-                gSum += (pixels[off + 1].toInt() and 0xFF) / 255f * weight
-                bSum += (pixels[off + 2].toInt() and 0xFF) / 255f * weight
-                aSum += (pixels[off + 3].toInt() and 0xFF) / 255f * weight
-                wSum += weight
+    private fun applyDefaults(type: BrushType) {
+        when (type) {
+            BrushType.Pencil -> {
+                _brushSize.value = 6f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0f; _waterContent.value = 0f
+                _pressureSizeEnabled.value = true
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = false
             }
-        }
-        if (wSum < 0.001f) return null
-        val avgA = aSum / wSum
-        if (avgA < 0.001f) return null
-        // プリマルチプライドの重み付き和をアンプリマルチプライド
-        val invA = 1f / avgA
-        return Color(
-            red   = (rSum / wSum * invA).coerceIn(0f, 1f),
-            green = (gSum / wSum * invA).coerceIn(0f, 1f),
-            blue  = (bSum / wSum * invA).coerceIn(0f, 1f),
-            alpha = avgA,
-        )
-    }
-
-    /**
-     * ぼかし筆圧モード用サンプリング (Fude / Watercolor 共通)。
-     *
-     * 仕様書 Step 1+2+3 をまとめて実装:
-     *   Step 1: 重み付きサンプリングで周囲の色を収集 (中心ほど高重み)
-     *   Step 2: 新しい色 = キャンバス色 × 水分量 (ぼかしモードは水分量=1)
-     *   Step 3: ガウス拡散 — 重み付きサンプリングが拡散を内包する
-     *
-     * canvasAlpha を alpha に格納して返す (GPU 側で透明域でのスタンプ抑制に使用)。
-     */
-    private fun canvasBlurMix(position: Offset, blurRadius: Int): Color? {
-        return sampleWeightedBlurAt(position, blurRadius)
-    }
-
-    /**
-     * ブラシ種別に応じたキャンバス混色計算。StrokePoint.color として保存され GPU 描画に使われる。
-     *
-     * ─── デジタル水彩の 3 ステップ (仕様書より) ───────────────────────────────
-     *   Step 1 サンプリング: sampleWeightedBlurAt で距離重み付き平均 (中心 > 外側)
-     *   Step 2 重み付き平均: 新しい色 = (描画色 × 筆の強さ) + (背景色 × 水分量)
-     *                        水分量 = colorStretch パラメータに対応
-     *   Step 3 拡散処理:     Step 1 の重み付きサンプリング半径が拡散を担う
-     *
-     * ─── ブラシ別の走行インク (strokeInkColor) ────────────────────────────────
-     *   Fude      : キャンバスを微弱吸収しつつブラシ色を強く補充 → 長いインク伸び
-     *   Watercolor: キャンバスを吸収せずブラシ色へ収束 → スタンプ毎にローカル混色
-     *   Marker    : キャンバスと混色しつつ走行インクを引きずる
-     *
-     * ─── 戻り値の alpha チャンネル ────────────────────────────────────────────
-     *   Fude/Watercolor 通常モード: canvasAlpha (GPU 側での透明域抑制・ぼかしモード判定に使用)
-     *   Fude/Watercolor ぼかしモード: canvasAlpha (透明域でスタンプを非表示にする)
-     *   Blur: sampleWeightedBlurAt の自然な avgA
-     */
-    private fun canvasMix(position: Offset, pressure: Float): Color? {
-        // ── サンプリングスロットル (Fude / Watercolor / Blur) ─────────────────
-        // spacing=1 等の過密スタンプでも「直前に書いた自分のピクセル」を
-        // 毎スタンプ読み返すフィードバックを防ぐ。
-        // ブラシ直径の MIX_STEP_FACTOR 倍の距離ごとのみサンプリングを更新し、
-        // 中間スタンプはキャッシュを返す → spacing=1 でも spacing=10 と同等の混色間隔。
-        val doThrottle = brushSettings.type == BrushType.Fude ||
-                         brushSettings.type == BrushType.Watercolor ||
-                         brushSettings.type == BrushType.Blur
-        if (doThrottle) {
-            val mixStep = (brushSettings.size * MIX_STEP_FACTOR).coerceIn(MIN_MIX_STEP, MAX_MIX_STEP)
-            if (lastMixPosition != null && (position - lastMixPosition!!).getDistance() < mixStep) {
-                return lastMixColor
+            BrushType.BinaryPen -> {
+                _brushSize.value = 4f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.1f
+                _colorStretch.value = 0f; _waterContent.value = 0f
+                _pressureSizeEnabled.value = false
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = false
             }
-        }
-
-        val result = when (brushSettings.type) {
-
-            // ── Fude: 微弱キャンバス吸収 + 強いブラシ色補充 → 引きずり感のある筆 ──
             BrushType.Fude -> {
-                // 水分量: 低筆圧ほど有効水分量が高まる (仕様書: 筆圧低→水分量高)
-                val effectiveWater = (brushSettings.waterContent * (1f + (1f - pressure) * 0.5f)).coerceIn(0f, 1f)
-                // ぼかし筆圧モード: blurPressureThreshold が明示的に設定された場合のみ発動。
-                // waterBlurBoost を廃止 (CPU/GPU の blurThreshold 不整合を防ぐ)。
-                if (brushSettings.blurPressureThreshold > 0f && pressure < brushSettings.blurPressureThreshold) {
-                    val r = (brushSettings.size * 0.20f).toInt().coerceIn(2, 18)
-                    canvasBlurMix(position, r)
-                } else {
-                    // 通常モード
-                    // 1点サンプリングではなく重み付きブラーで周辺色を読む → 色の拡散を改善
-                    val diffuseR = (brushSettings.size * 0.20f).toInt().coerceIn(2, 15)
-                    val canvasRgb = sampleWeightedBlurAt(position, diffuseR)
-                    // 重み付き平均アルファを使用 (単一ピクセルより滑らか)
-                    val canvasAlpha = canvasRgb?.alpha ?: 0f
-                    val ink = strokeInkColor ?: currentColor.copy(alpha = 1f)
-                    val p  = pressure.coerceIn(0f, 1f)
-                    val ps = p * p * (3f - 2f * p)
-                    val mixScale = if (brushSettings.pressureMixEnabled)
-                        pressureCurveWithIntensity(pressure, brushSettings.pressureMixIntensity) else 1f
-                    // Step 2: 水分量が高いほどキャンバス吸収が増加し、描画色が薄まる
-                    val absorptionWaterScale = 1f + effectiveWater * 2f
-                    val absorption = (brushSettings.colorStretch * mixScale * canvasAlpha * ps * FUDE_ABSORB_SCALE * absorptionWaterScale)
-                        .coerceIn(0f, 0.6f)
-                    val absorbed = if (canvasRgb != null)
-                        lerp(ink, canvasRgb.copy(alpha = 1f), absorption) else ink
-                    val refreshWaterScale = (1f - effectiveWater * 0.7f).coerceAtLeast(0.05f)
-                    val refreshRate = (brushSettings.density * mixScale * FUDE_REFRESH_RATE * ps * refreshWaterScale)
-                        .coerceIn(0f, 0.9f)
-                    val newInk = lerp(absorbed, currentColor.copy(alpha = 1f), refreshRate)
-                    strokeInkColor = newInk.copy(alpha = 1f)
-                    newInk.copy(alpha = canvasAlpha)
-                }
+                _brushSize.value = 14f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0.7f; _waterContent.value = 0f
+                _filterPressureThreshold.value = 0.3f
+                _pressureSizeEnabled.value = false
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = true
             }
-
-            // ── Watercolor: 走行インクはブラシ色へ収束、スタンプ毎にキャンバスと混色 ──
             BrushType.Watercolor -> {
-                val effectiveWater = (brushSettings.waterContent * (1f + (1f - pressure) * 0.5f)).coerceIn(0f, 1f)
-                // ぼかし強度倍率: 1=デフォルト半径, 100=10倍の半径 (線形補間)
-                val blurMult = 1f + (brushSettings.watercolorBlurStrength - 1) / 99f * 9f
-                // waterBlurBoost を廃止 (CPU/GPU 不整合解消)。blurPressureThreshold が0のとき
-                // blur モードに入らず、キャンバス上に何もない場合でも正しくブラシ色が描画される。
-                if (brushSettings.blurPressureThreshold > 0f && pressure < brushSettings.blurPressureThreshold) {
-                    val r = (brushSettings.size * 0.30f * blurMult).toInt().coerceIn(3, 150)
-                    canvasBlurMix(position, r)
-                } else {
-                    val p  = pressure.coerceIn(0f, 1f)
-                    val ps = p * p * (3f - 2f * p)
-                    val mixScale = if (brushSettings.pressureMixEnabled)
-                        pressureCurveWithIntensity(pressure, brushSettings.pressureMixIntensity) else 1f
-                    // Step 1: サンプリング半径を拡大 (拡散改善) + 水分量でさらに広がる + ぼかし強度倍率
-                    val samplingRadius = (brushSettings.size * 0.25f * (1f + effectiveWater * 0.5f) * blurMult).toInt().coerceIn(3, 150)
-                    val canvasRgb = sampleWeightedBlurAt(position, samplingRadius)
-                    // 重み付き平均アルファを使用 (単一ピクセルより滑らか)
-                    val canvasAlpha = canvasRgb?.alpha ?: 0f
-                    val refreshWaterScale = (1f - effectiveWater * 0.7f).coerceAtLeast(0.05f)
-                    val refreshRate = (brushSettings.density * mixScale * WATERCOLOR_REFRESH_RATE * ps * refreshWaterScale)
-                        .coerceIn(0f, 0.9f)
-                    val ink = strokeInkColor ?: currentColor.copy(alpha = 1f)
-                    val newInk = lerp(ink, currentColor.copy(alpha = 1f), refreshRate)
-                    strokeInkColor = newInk.copy(alpha = 1f)
-                    // Step 2: 水分量パラメータが高いほどキャンバス色が強く混ざる
-                    val waterMixScale = 1f + effectiveWater * 1.5f
-                    val waterAmount = (brushSettings.colorStretch * mixScale * canvasAlpha * ps * WATERCOLOR_MIX_SCALE * waterMixScale)
-                        .coerceIn(0f, 0.85f)
-                    val stampRgb = if (canvasRgb != null)
-                        lerp(newInk, canvasRgb.copy(alpha = 1f), waterAmount) else newInk
-                    stampRgb.copy(alpha = canvasAlpha)
-                }
+                _brushSize.value = 18f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.08f
+                _colorStretch.value = 0.2f; _waterContent.value = 0.7f
+                _filterPressureThreshold.value = 0.3f
+                _pressureSizeEnabled.value = false
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = true
             }
-
-            // ── Marker: GL_MAX アルファ + 走行インク ─────────────────────────
+            BrushType.Airbrush -> {
+                _brushSize.value = 30f; _brushOpacity.value = 1f; _brushHardness.value = 0f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0f; _waterContent.value = 0f
+                _pressureSizeEnabled.value = true
+                _pressureOpacityEnabled.value = true
+                _pressureSmudgeEnabled.value = false
+            }
             BrushType.Marker -> {
-                val sampled = samplePixelAt(position)
-                val drag    = brushSettings.colorStretch
-                if (sampled != null) {
-                    // 筆ツール混色に近いバランスで既存色とインクを混ぜる (density=1.0 で約60%インク)
-                    val strength = (brushSettings.density * 0.45f + 0.15f).coerceIn(0.1f, 0.65f)
-                    val freshMix = lerp(sampled, currentColor, strength)
-                    val carried  = strokeInkColor
-                    val dragged  = if (carried != null && drag > 0f)
-                        lerp(freshMix, carried, drag) else freshMix
-                    strokeInkColor = dragged.copy(alpha = 1f)
-                    dragged
-                } else {
-                    val carried = strokeInkColor
-                    val result  = if (carried != null && drag > 0f)
-                        lerp(currentColor, carried, drag) else currentColor
-                    strokeInkColor = result.copy(alpha = 1f)
-                    result
-                }
+                _brushSize.value = 12f; _brushOpacity.value = 0.5f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0.3f; _waterContent.value = 0f
+                _pressureSizeEnabled.value = false
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = false
             }
-
-            // ── Blur: Step 1+3 のみ (重み付きサンプリング = にじみ拡散) ────────
+            BrushType.Eraser -> {
+                _brushSize.value = 20f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0f; _waterContent.value = 0f
+                _pressureSizeEnabled.value = true
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = false
+            }
             BrushType.Blur -> {
-                val radius = ((brushSettings.size / 2f) * brushSettings.blurStrength).toInt().coerceIn(2, 50)
-                sampleWeightedBlurAt(position, radius)
+                _brushSize.value = 20f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0f; _waterContent.value = 0f
+                _blurStrength.value = 0.5f
+                _pressureSizeEnabled.value = true
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = false
             }
-
-            else -> null
-        }
-
-        if (doThrottle) {
-            lastMixPosition = position
-            lastMixColor = result
-        }
-        return result
-    }
-
-    companion object {
-        // ── 筆 (Fude) ──────────────────────────────────────────────────────
-        /**
-         * キャンバス吸収スケール (仕様書 Step 2 の「水分量」制御)。
-         * 吸収率 = colorStretch × canvasAlpha × ps × ABSORB_SCALE  (上限 0.5)
-         * colorStretch=0.5, canvasAlpha=0.7, ps=1.0 → 吸収 ≈ 8.75%/stamp
-         * → ink が少しずつキャンバス色に近づき「引きずり感」を生む。
-         */
-        private const val FUDE_ABSORB_SCALE  = 0.25f
-        /**
-         * ブラシ色補充率 (仕様書 Step 2 の「筆の強さ」)。density=70%, ps=1 で ≈ 21%/stamp 補充。
-         * 吸収の後に補充することでブラシ色が長く維持される。
-         */
-        private const val FUDE_REFRESH_RATE  = 0.30f
-
-        // ── 水彩筆 (Watercolor) ─────────────────────────────────────────────
-        /**
-         * 走行インクのブラシ色収束率 (仕様書 Step 2 の「筆の強さ」)。
-         * density=100%, ps=1 で ≈ 20%/stamp。ink はキャンバスを吸収せず収束のみ。
-         */
-        private const val WATERCOLOR_REFRESH_RATE = 0.20f
-        /**
-         * スタンプ時点の水分量スケール (仕様書 Step 2 の「キャンバスの水分量」)。
-         * waterAmount = colorStretch × canvasAlpha × ps × MIX_SCALE  (上限 0.7)
-         * colorStretch=0.5, canvasAlpha=0.7 → ≈ 17.5%/stamp キャンバス色が混入。
-         */
-        private const val WATERCOLOR_MIX_SCALE    = 0.50f
-
-        // ── 折り返し検出 ─────────────────────────────────────────────────────
-        /**
-         * 折り返し判定のコサイン閾値。正規化方向ベクトルの内積がこれを下回ると折り返しとみなす。
-         * -0.5 ≈ cos(120°): 120° 以上の方向転換で発動。
-         */
-        private const val REVERSAL_DOT_THRESHOLD = -0.5f
-        /**
-         * 折り返し時に走行インクをブラシ色へリセットする割合 (0=リセットなし, 1=完全リセット)。
-         * 0.8 = 80% ブラシ色に近づける → 引きずり色がほぼ解消される。
-         */
-        private const val REVERSAL_INK_RESET = 0.8f
-
-        // ── 混色サンプリングスロットル ────────────────────────────────────────
-        /**
-         * サンプリング間隔 = ブラシ直径 × MIX_STEP_FACTOR。
-         * spacing=1 でも spacing=10 と同等の混色密度を保つ。
-         * 値を上げると色の変化が遅くなり (より長い引きずり)、
-         * 値を下げると密なサンプリングになる (より即時の混色)。
-         */
-        private const val MIX_STEP_FACTOR = 0.40f
-        /** サンプリング間隔の最小値 (px)。小さいブラシで過密にならないように。 */
-        private const val MIN_MIX_STEP    = 3f
-        /** サンプリング間隔の最大値 (px)。大きいブラシで疎になりすぎないように。 */
-        private const val MAX_MIX_STEP    = 50f
-
-        /**
-         * 感度付き筆圧カーブ: p^gamma
-         * intensity=1..100: gamma = 0.1..0.65 (低強度=ほぼ均一, 標準=0.65)
-         * intensity=101..200: gamma = 0.65..2.0 (高強度=急峻な感度)
-         */
-        fun pressureCurveWithIntensity(p: Float, intensity: Int): Float {
-            val gamma = if (intensity <= 100) {
-                0.1f + (intensity - 1) / 99f * 0.55f
-            } else {
-                0.65f + (intensity - 100) / 100f * 1.35f
+            BrushType.Fill -> {
+                _brushSize.value = 1f; _brushOpacity.value = 1f; _brushHardness.value = 1f
+                _brushDensity.value = 1f; _brushSpacing.value = 0.15f
+                _colorStretch.value = 0f; _waterContent.value = 0f
+                _pressureSizeEnabled.value = false
+                _pressureOpacityEnabled.value = false
+                _pressureSmudgeEnabled.value = false
             }
-            return p.coerceIn(0f, 1f).toDouble().pow(gamma.toDouble()).toFloat()
         }
     }
 
-
-
-    // ── Drawing ──
-
-    fun startStroke(position: Offset, pressure: Float = 1f) {
-        val layer = activeLayer ?: return
-        if (layer.isLocked) return
-        isDrawing = true
-        strokeInkColor = null
-        lastMixPosition = null
-        lastMixColor = null
-        lastMoveDir = Offset.Zero
-        _currentStrokePoints.clear()
-        _currentStrokePoints.add(StrokePoint(position, pressure, canvasMix(position, pressure)))
-        strokeVersion++
+    fun setBrushSize(v: Float) { _brushSize.value = v.coerceIn(1f, 2000f) }
+    fun setBrushOpacity(v: Float) { _brushOpacity.value = v.coerceIn(0.01f, 1f) }
+    fun setBrushHardness(v: Float) { _brushHardness.value = v.coerceIn(0f, 1f) }
+    fun setBrushDensity(v: Float) { _brushDensity.value = v.coerceIn(0.01f, 1f) }
+    fun setBrushSpacing(v: Float) { _brushSpacing.value = v.coerceIn(0.01f, 2f) }
+    fun setColorStretch(v: Float) { _colorStretch.value = v.coerceIn(0f, 1f) }
+    fun setWaterContent(v: Float) { _waterContent.value = v.coerceIn(0f, 1f) }
+    fun setBlurStrength(v: Float) { _blurStrength.value = v.coerceIn(0.05f, 1f) }
+    fun setFilterPressureThreshold(v: Float) { _filterPressureThreshold.value = v.coerceIn(0f, 1f) }
+    fun setFillTolerance(v: Float) { _fillTolerance.value = v.coerceIn(0f, 255f) }
+    fun togglePressureSize() { _pressureSizeEnabled.value = !_pressureSizeEnabled.value }
+    fun togglePressureOpacity() { _pressureOpacityEnabled.value = !_pressureOpacityEnabled.value }
+    fun togglePressureSmudge() { _pressureSmudgeEnabled.value = !_pressureSmudgeEnabled.value }
+    fun setColor(color: Color, addToHistory: Boolean = true) {
+        _currentColor.value = color
+        if (addToHistory) {
+            val hist = colorHistory.value.toMutableList()
+            hist.remove(color); hist.add(0, color)
+            if (hist.size > 20) hist.removeLast()
+            colorHistory.value = hist
+        }
     }
 
-    fun addStrokePoint(position: Offset, pressure: Float = 1f) {
-        if (!isDrawing) return
-        if (_currentStrokePoints.isNotEmpty()) {
-            val last = _currentStrokePoints.last()
-            val dist = (position - last.position).getDistance()
-            if (dist < 1f) return
-            val s = brushSettings.stabilizer * 0.5f
-            val smoothed = Offset(
-                last.position.x + (position.x - last.position.x) * (1f - s),
-                last.position.y + (position.y - last.position.y) * (1f - s),
-            )
+    fun activateEyedropper() { _toolMode.value = ToolMode.Eyedropper; updateSelectionOverlayMode() }
+    fun deactivateEyedropper() { _toolMode.value = ToolMode.Draw; updateSelectionOverlayMode() }
 
-            // 折り返し検出: 前フレームとの方向ベクトルの内積が負 → 大きな方向転換
-            val delta = smoothed - last.position
-            val moveDist = delta.getDistance()
-            if (moveDist > 0.5f) {
-                val dir = delta / moveDist
-                if (lastMoveDir != Offset.Zero) {
-                    val dot = lastMoveDir.x * dir.x + lastMoveDir.y * dir.y
-                    if (dot < REVERSAL_DOT_THRESHOLD) {
-                        onStrokeReversal()
+    // ── 選択ツール ──
+    fun setToolMode(mode: ToolMode) {
+        _toolMode.value = mode
+        updateSelectionOverlayMode()
+    }
+    fun setSelectionTolerance(v: Float) { _selectionTolerance.value = v.coerceIn(0f, 255f) }
+    fun toggleSelectionAddMode() { _selectionAddMode.value = !_selectionAddMode.value }
+
+    fun selectAll() { _document?.selectAll(); updateSelectionState() }
+    fun clearSelection() { _document?.clearSelection(); updateSelectionState() }
+    fun invertSelection() { _document?.invertSelection(); updateSelectionState() }
+
+    private fun updateSelectionState() {
+        _hasSelection.value = _document?.hasSelection == true
+        updateSelectionOverlayMode()
+    }
+
+    /** ToolMode と hasSelection に基づいて GPU オーバーレイモードを更新 */
+    private fun updateSelectionOverlayMode() {
+        val mode = _toolMode.value
+        val hasSel = _hasSelection.value
+        renderer.selectionOverlayMode = when {
+            !hasSel -> CanvasRenderer.OVERLAY_NONE
+            mode == ToolMode.SelectRect || mode == ToolMode.SelectAuto ||
+            mode == ToolMode.SelectPen || mode == ToolMode.SelectEraser -> CanvasRenderer.OVERLAY_BLUE
+            mode == ToolMode.Draw || mode == ToolMode.Eyedropper -> CanvasRenderer.OVERLAY_MARCHING_ANTS
+            else -> CanvasRenderer.OVERLAY_NONE
+        }
+    }
+
+    /** 塗りつぶし実行 */
+    private fun fillAtPoint(doc: CanvasDocument, x: Int, y: Int) {
+        val c = _currentColor.value
+        val argb = (0xFF shl 24) or ((c.red * 255).toInt() shl 16) or
+            ((c.green * 255).toInt() shl 8) or (c.blue * 255).toInt()
+        val fillColor = PixelOps.premultiply(argb)
+        doc.pushUndoForFill()
+        val layer = doc.layers.find { it.id == doc.activeLayerId } ?: return
+        FillTool.floodFill(
+            layer.content, x, y, fillColor,
+            _fillTolerance.value.toInt().coerceIn(0, 255),
+            doc.dirtyTracker,
+        )
+        doc.dirtyTracker.markFullRebuild()
+        updateUndoState()
+        onStrokeEnd()
+    }
+
+    /**
+     * BrushConfig を構築。
+     *
+     * モード方針:
+     *  - Pencil: Indirect (Wash) モード → サブレイヤー合成で均一不透明度
+     *  - Marker: Direct モード + BLEND_MARKER (アルファ比較) + smudge (色混合)
+     *  - Fude, Watercolor: Direct + BLEND_MIX (RGB+alpha 混色)
+     *  - Airbrush, Eraser, Blur: Direct モード
+     *
+     * 筆/水彩筆/ぼかしは不透明度プロパティを使用しない (Direct mode で density が制御)。
+     * マーカーは不透明度がアルファ上限を制御する。
+     */
+    private fun buildBrushConfig(): BrushConfig {
+        val c = _currentColor.value
+        val argb = (0xFF shl 24) or ((c.red * 255).toInt() shl 16) or
+            ((c.green * 255).toInt() shl 8) or (c.blue * 255).toInt()
+        val type = _brushType.value
+        val isMixBrush = type == BrushType.Fude || type == BrushType.Watercolor
+        val isMarker = type == BrushType.Marker
+        val isBinary = type == BrushType.BinaryPen
+        return BrushConfig(
+            size = _brushSize.value,
+            opacity = _brushOpacity.value,
+            density = _brushDensity.value,
+            spacing = _brushSpacing.value,
+            hardness = if (isBinary) 1f else _brushHardness.value,
+            colorPremul = PixelOps.premultiply(argb),
+            isEraser = type == BrushType.Eraser,
+            isMarker = isMarker,
+            isBlur = type == BrushType.Blur,
+            isBinaryPen = isBinary,
+            smudge = when {
+                isMixBrush || isMarker -> _colorStretch.value
+                else -> 0f
+            },
+            resmudge = 0,
+            blurStrength = _blurStrength.value,
+            // Pencil / BinaryPen: Indirect (均一不透明度)
+            // Marker: Indirect (サブレイヤーで継ぎ目なしストローク)
+            indirect = type == BrushType.Pencil || type == BrushType.Marker || isBinary,
+            pressureSizeEnabled = _pressureSizeEnabled.value,
+            pressureOpacityEnabled = _pressureOpacityEnabled.value,
+            pressureSmudgeEnabled = _pressureSmudgeEnabled.value,
+            pressureSizeIntensity = when (type) {
+                BrushType.Pencil -> 100
+                BrushType.Airbrush -> 80
+                BrushType.Eraser -> 90
+                else -> 100
+            },
+            pressureOpacityIntensity = when (type) {
+                BrushType.Airbrush -> 70
+                else -> 100
+            },
+            pressureSmudgeIntensity = when (type) {
+                BrushType.Fude -> 80
+                BrushType.Watercolor -> 60
+                else -> 100
+            },
+            taperEnabled = type != BrushType.Eraser && type != BrushType.Marker && !isBinary,
+            waterContent = _waterContent.value,
+            colorStretch = _colorStretch.value,
+            filterPressureThreshold = if (isMixBrush) _filterPressureThreshold.value else 0f,
+            antiAliasing = if (isBinary) 0f else 1f,
+        )
+    }
+
+    // ── タッチ入力 ──────────────────────────────────────────────────
+
+    fun onTouchEvent(event: MotionEvent): Boolean {
+        val doc = _document ?: return false
+
+        if (event.pointerCount >= 2) { handleMultiTouch(event); return true }
+
+        if (isMultiTouch && event.actionMasked == MotionEvent.ACTION_MOVE) return true
+        if (isMultiTouch && event.actionMasked == MotionEvent.ACTION_UP) { isMultiTouch = false; return true }
+
+        // 消しゴム端の自動検出
+        val isEraserTip = event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+
+        val mode = _toolMode.value
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                isMultiTouch = false
+                longPressJob?.cancel()
+                // Start long-press eyedropper timer for Draw mode
+                if (mode == ToolMode.Draw && _brushType.value != BrushType.Fill) {
+                    longPressStartX = event.x
+                    longPressStartY = event.y
+                    longPressJob = viewModelScope.launch {
+                        delay(500)
+                        // Long press confirmed — sample color at touch point
+                        val (dx, dy) = screenToDoc(longPressStartX, longPressStartY)
+                        val sampled = doc.eyedropperAt(dx.toInt(), dy.toInt())
+                        val up = PixelOps.unpremultiply(sampled)
+                        setColor(Color(PixelOps.red(up) / 255f, PixelOps.green(up) / 255f, PixelOps.blue(up) / 255f))
+                        // Cancel in-progress stroke
+                        if (_isDrawing.value) {
+                            doc.undo() // Undo the partial stroke
+                            _isDrawing.value = false
+                        }
                     }
                 }
-                lastMoveDir = dir
+                if (mode == ToolMode.Eyedropper) {
+                    val (dx, dy) = screenToDoc(event.x, event.y)
+                    val sampled = doc.eyedropperAt(dx.toInt(), dy.toInt())
+                    val up = PixelOps.unpremultiply(sampled)
+                    setColor(Color(PixelOps.red(up) / 255f, PixelOps.green(up) / 255f, PixelOps.blue(up) / 255f), addToHistory = false)
+                    _toolMode.value = ToolMode.Draw
+                    return true
+                }
+                // 自動選択: シングルタップで実行
+                if (mode == ToolMode.SelectAuto) {
+                    val (dx, dy) = screenToDoc(event.x, event.y)
+                    doc.autoSelect(dx.toInt(), dy.toInt(),
+                        _selectionTolerance.value.toInt().coerceIn(0, 255),
+                        _selectionAddMode.value)
+                    updateSelectionState()
+                    return true
+                }
+                // 矩形選択: ドラッグ開始
+                if (mode == ToolMode.SelectRect) {
+                    val (dx, dy) = screenToDoc(event.x, event.y)
+                    rectSelStartX = dx; rectSelStartY = dy
+                    _isDrawing.value = true
+                    return true
+                }
+                // 選択ペン / 選択消しゴム: ブラシでマスク描画
+                if (mode == ToolMode.SelectPen || mode == ToolMode.SelectEraser) {
+                    val mask = doc.getOrCreateSelectionMask()
+                    _isDrawing.value = true
+                    processSelectionDraw(event, doc, mask, mode == ToolMode.SelectEraser)
+                    return true
+                }
+                // 塗りつぶしツール: シングルタップで実行
+                if (_brushType.value == BrushType.Fill) {
+                    val (dx, dy) = screenToDoc(event.x, event.y)
+                    fillAtPoint(doc, dx.toInt(), dy.toInt())
+                    return true
+                }
+                var brush = buildBrushConfig()
+                if (isEraserTip) brush = brush.copy(isEraser = true, indirect = false)
+                doc.beginStroke(brush)
+                _isDrawing.value = true
+                processDrawPoints(event, doc, brush)
             }
-
-            _currentStrokePoints.add(StrokePoint(smoothed, pressure, canvasMix(smoothed, pressure)))
-            strokeVersion++
-        }
-    }
-
-    /**
-     * ストローク折り返し時の処理。
-     * 走行インクをブラシ色に近づけて引きずりをリセットし、
-     * サンプリングスロットルもリセットして折り返し後のサンプリングを即座に有効化する。
-     */
-    private fun onStrokeReversal() {
-        if (brushSettings.type != BrushType.Fude &&
-            brushSettings.type != BrushType.Watercolor &&
-            brushSettings.type != BrushType.Blur) return
-        // 走行インクをブラシ色へリセット (引きずり解消)
-        strokeInkColor = strokeInkColor?.let {
-            lerp(it, currentColor.copy(alpha = 1f), REVERSAL_INK_RESET)
-        }
-        // スロットルリセット: 折り返し後は即座にフレッシュなサンプリングから開始
-        lastMixPosition = null
-        lastMixColor = null
-    }
-
-    fun endStroke() {
-        if (!isDrawing) return
-        isDrawing = false
-        strokeInkColor = null
-        lastMixPosition = null
-        lastMixColor = null
-
-        if (_currentStrokePoints.size >= 2) {
-            val stroke = Stroke(
-                points  = _currentStrokePoints.toList(),
-                brush   = brushSettings.copy(),
-                color   = currentColor,
-                layerId = activeLayerId,
-            )
-            val idx = layers.indexOfFirst { it.id == activeLayerId }
-            if (idx >= 0) {
-                val layer = layers[idx]
-                layers[idx] = layer.copy(strokes = layer.strokes + stroke)
-                pushUndo(CanvasAction.AddStroke(stroke, activeLayerId))
+            MotionEvent.ACTION_MOVE -> {
+                // Cancel long-press if finger moved significantly
+                if (longPressJob?.isActive == true) {
+                    val moveDist = sqrt(
+                        (event.x - longPressStartX) * (event.x - longPressStartX) +
+                        (event.y - longPressStartY) * (event.y - longPressStartY)
+                    )
+                    if (moveDist > 15f) longPressJob?.cancel()
+                }
+                if (_isDrawing.value) {
+                    if (mode == ToolMode.SelectRect) {
+                        // 矩形選択ドラッグ中 — 何もしない (UP で確定)
+                    } else if (mode == ToolMode.SelectPen || mode == ToolMode.SelectEraser) {
+                        val mask = doc.getOrCreateSelectionMask()
+                        processSelectionDraw(event, doc, mask, mode == ToolMode.SelectEraser)
+                    } else {
+                        var brush = buildBrushConfig()
+                        if (isEraserTip) brush = brush.copy(isEraser = true, indirect = false)
+                        processDrawPoints(event, doc, brush)
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                longPressJob?.cancel()
+                if (_isDrawing.value) {
+                    if (mode == ToolMode.SelectRect) {
+                        // 矩形選択確定
+                        val (dx, dy) = screenToDoc(event.x, event.y)
+                        doc.selectRect(
+                            rectSelStartX.toInt(), rectSelStartY.toInt(),
+                            dx.toInt(), dy.toInt(),
+                            _selectionAddMode.value)
+                        updateSelectionState()
+                    } else if (mode == ToolMode.SelectPen || mode == ToolMode.SelectEraser) {
+                        // 消去モードでマスクが空になった可能性があるため再計算
+                        doc.selectionMask?.recomputeHasSelection()
+                        doc.publishSelectionSnapshot()
+                        updateSelectionState()
+                    } else {
+                        var brush = buildBrushConfig()
+                        if (isEraserTip) brush = brush.copy(isEraser = true, indirect = false)
+                        doc.endStroke(brush)
+                        updateUndoState()
+                        onStrokeEnd()
+                    }
+                    _isDrawing.value = false
+                }
             }
         }
-        _currentStrokePoints.clear()
-        strokeVersion++
+        return true
     }
 
-    // ── Layers ──
+    /** 選択ペン / 選択消しゴムでマスクにダブを描画 */
+    private fun processSelectionDraw(
+        event: MotionEvent, doc: CanvasDocument,
+        mask: com.propaint.app.engine.SelectionMask, isErase: Boolean,
+    ) {
+        val size = _brushSize.value
+        val hardness = _brushHardness.value
+        for (h in 0 until event.historySize) {
+            val (dx, dy) = screenToDoc(event.getHistoricalX(h), event.getHistoricalY(h))
+            val dab = com.propaint.app.engine.DabMaskGenerator.createDab(dx, dy, size, hardness)
+            if (dab != null) mask.applyDab(dab, isErase, 255)
+        }
+        val (dx, dy) = screenToDoc(event.x, event.y)
+        val dab = com.propaint.app.engine.DabMaskGenerator.createDab(dx, dy, size, hardness)
+        if (dab != null) mask.applyDab(dab, isErase, 255)
+        // 選択マスクのみ更新 (コンポジットキャッシュの再構築は不要)
+        doc.publishSelectionSnapshot()
+    }
+
+    private fun processDrawPoints(event: MotionEvent, doc: CanvasDocument, brush: BrushConfig) {
+        for (h in 0 until event.historySize) {
+            val (dx, dy) = screenToDoc(event.getHistoricalX(h), event.getHistoricalY(h))
+            doc.strokeTo(BrushEngine.StrokePoint(dx, dy, event.getHistoricalPressure(h)), brush)
+        }
+        val (dx, dy) = screenToDoc(event.x, event.y)
+        doc.strokeTo(BrushEngine.StrokePoint(dx, dy, event.pressure), brush)
+    }
+
+    private fun screenToDoc(sx: Float, sy: Float): Pair<Float, Float> {
+        val doc = _document ?: return sx to sy
+        val sw = renderer.surfaceWidth.toFloat(); val sh = renderer.surfaceHeight.toFloat()
+        if (sw <= 0 || sh <= 0) return sx to sy
+        val bs = min(sw / doc.width, sh / doc.height); val fs = bs * _zoom
+        val cx = sw / 2f + _panX; val cy = sh / 2f + _panY
+        val dx = sx - cx; val dy = sy - cy
+        val cosR = cos(-_rotation.toDouble()).toFloat(); val sinR = sin(-_rotation.toDouble()).toFloat()
+        return Pair((dx * cosR - dy * sinR) / fs + doc.width / 2f,
+            (dx * sinR + dy * cosR) / fs + doc.height / 2f)
+    }
+
+    private fun handleMultiTouch(event: MotionEvent) {
+        longPressJob?.cancel() // Cancel long-press eyedropper on multi-touch
+        if (!isMultiTouch && _isDrawing.value) {
+            _document?.endStroke(buildBrushConfig()); _isDrawing.value = false
+        }
+        val x0 = event.getX(0); val y0 = event.getY(0)
+        val x1 = event.getX(1); val y1 = event.getY(1)
+        val midX = (x0 + x1) / 2f; val midY = (y0 + y1) / 2f
+        val dist = sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0))
+        val angle = atan2((y1 - y0).toDouble(), (x1 - x0).toDouble()).toFloat()
+        when (event.actionMasked) {
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (!isMultiTouch) {
+                    // First multi-touch start
+                    gestureTotalMovement = 0f
+                    gestureMaxPointers = event.pointerCount
+                    gestureStartTime = System.currentTimeMillis()
+                } else {
+                    // Additional finger added
+                    if (event.pointerCount > gestureMaxPointers) {
+                        gestureMaxPointers = event.pointerCount
+                    }
+                }
+                isMultiTouch = true; gestureStartDist = dist; gestureStartZoom = _zoom
+                gestureStartAngle = angle; gestureStartRotation = _rotation
+                gestureStartPanX = _panX; gestureStartPanY = _panY
+                gestureStartMidX = midX; gestureStartMidY = midY
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (isMultiTouch && gestureStartDist > 10f) {
+                    val moveDelta = sqrt(
+                        (midX - gestureStartMidX) * (midX - gestureStartMidX) +
+                        (midY - gestureStartMidY) * (midY - gestureStartMidY)
+                    )
+                    gestureTotalMovement += moveDelta
+                    _zoom = (gestureStartZoom * dist / gestureStartDist).coerceIn(0.1f, 30f)
+                    _rotation = gestureStartRotation + (angle - gestureStartAngle)
+                    _panX = gestureStartPanX + (midX - gestureStartMidX)
+                    _panY = gestureStartPanY + (midY - gestureStartMidY)
+                    renderer.pendingTransform.set(floatArrayOf(_zoom, _panX, _panY, _rotation))
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                // Check for tap gesture when last extra finger lifts
+                if (event.pointerCount == 2) {
+                    val elapsed = System.currentTimeMillis() - gestureStartTime
+                    // Tap: short duration (<300ms) and minimal movement (<30px)
+                    if (elapsed < 300 && gestureTotalMovement < 30f) {
+                        when (gestureMaxPointers) {
+                            2 -> undo()
+                            3 -> redo()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── レイヤー操作 ────────────────────────────────────────────────
 
     fun addLayer() {
-        val newLayer = PaintLayer(name = "レイヤー ${layers.size + 1}")
-        val idx = layers.indexOfFirst { it.id == activeLayerId }
-        val insertAt = idx + 1
-        layers.add(insertAt, newLayer)
-        activeLayerId = newLayer.id
-        pushUndo(CanvasAction.AddLayer(newLayer, insertAt))
+        val doc = _document ?: return
+        doc.addLayer("レイヤー ${doc.layers.size + 1}"); updateLayerState()
+    }
+    fun removeLayer(id: Int) { _document?.removeLayer(id); updateLayerState() }
+    fun selectLayer(id: Int) { _document?.setActiveLayer(id); updateLayerState() }
+    fun setLayerVisibility(id: Int, v: Boolean) { _document?.setLayerVisibility(id, v); updateLayerState() }
+    fun setLayerOpacity(id: Int, v: Float) { _document?.setLayerOpacity(id, v); updateLayerState() }
+    fun setLayerBlendMode(id: Int, m: Int) { _document?.setLayerBlendMode(id, m); updateLayerState() }
+    fun setLayerClip(id: Int, clip: Boolean) { _document?.setLayerClipToBelow(id, clip); updateLayerState() }
+    fun setLayerLocked(id: Int, locked: Boolean) { _document?.setLayerLocked(id, locked); updateLayerState() }
+    fun clearActiveLayer() { _document?.let { it.clearLayer(it.activeLayerId) }; updateLayerState() }
+    fun duplicateLayer(id: Int) { _document?.duplicateLayer(id); updateLayerState() }
+    fun mergeDown(id: Int) { _document?.mergeDown(id); updateLayerState() }
+    fun flipLayerHorizontal(id: Int) { _document?.flipLayerHorizontal(id); updateLayerState() }
+    fun flipLayerVertical(id: Int) { _document?.flipLayerVertical(id); updateLayerState() }
+
+    /** レイヤーを1つ上に移動 (合成順で上 = リスト末尾方向) */
+    fun moveLayerUp(id: Int) {
+        val doc = _document ?: return
+        val idx = doc.layers.indexOfFirst { it.id == id }
+        if (idx < 0 || idx >= doc.layers.size - 1) return
+        doc.moveLayer(idx, idx + 1)
+        updateLayerState()
     }
 
-    fun removeLayer(layerId: String) {
-        if (layers.size <= 1) return
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx < 0) return
-        val removed = layers.removeAt(idx)
-        if (activeLayerId == layerId) {
-            activeLayerId = layers[maxOf(0, idx - 1)].id
-        }
-        pushUndo(CanvasAction.RemoveLayer(removed, idx))
-    }
-
-    fun selectLayer(layerId: String) { activeLayerId = layerId }
-
-    fun toggleLayerVisibility(layerId: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) layers[idx] = layers[idx].copy(isVisible = !layers[idx].isVisible)
-    }
-
-    fun toggleLayerLock(layerId: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) layers[idx] = layers[idx].copy(isLocked = !layers[idx].isLocked)
-    }
-
-    fun setLayerOpacity(layerId: String, opacity: Float) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) layers[idx] = layers[idx].copy(opacity = opacity.coerceIn(0f, 1f))
-    }
-
-    fun setLayerBlendMode(layerId: String, mode: LayerBlendMode) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) layers[idx] = layers[idx].copy(blendMode = mode)
-    }
-
-    fun clearLayer(layerId: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) {
-            val prev = layers[idx].strokes
-            layers[idx] = layers[idx].copy(strokes = emptyList())
-            pushUndo(CanvasAction.ClearLayer(layerId, prev))
-        }
-    }
-
-    fun duplicateLayer(layerId: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx < 0) return
-        val source = layers[idx]
-        val copy = source.copy(
-            id   = java.util.UUID.randomUUID().toString(),
-            name = "${source.name} コピー",
-        )
-        val insertAt = idx + 1
-        layers.add(insertAt, copy)
-        activeLayerId = copy.id
-        pushUndo(CanvasAction.DuplicateLayer(copy, insertAt))
-    }
-
-    fun mergeDown(layerId: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
+    /** レイヤーを1つ下に移動 (合成順で下 = リスト先頭方向) */
+    fun moveLayerDown(id: Int) {
+        val doc = _document ?: return
+        val idx = doc.layers.indexOfFirst { it.id == id }
         if (idx <= 0) return
-        val upper = layers[idx]
-        val lower = layers[idx - 1]
-        layers[idx - 1] = lower.copy(strokes = lower.strokes + upper.strokes)
-        layers.removeAt(idx)
-        activeLayerId = layers[idx - 1].id
-        pushUndo(CanvasAction.MergeDown(upper, lower, idx))
+        doc.moveLayer(idx, idx - 1)
+        updateLayerState()
     }
 
-    fun renameLayer(layerId: String, newName: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) layers[idx] = layers[idx].copy(name = newName)
+    // ── フィルター ──────────────────────────────────────────────────
+
+    fun applyHslFilter(hue: Float, sat: Float, lit: Float) {
+        val doc = _document ?: return
+        doc.applyHslFilter(doc.activeLayerId, hue, sat, lit); updateUndoState()
     }
 
-    fun toggleClippingMask(layerId: String) {
-        val idx = layers.indexOfFirst { it.id == layerId }
-        if (idx >= 0) layers[idx] = layers[idx].copy(isClippingMask = !layers[idx].isClippingMask)
+    fun applyBrightnessContrast(brightness: Float, contrast: Float) {
+        val doc = _document ?: return
+        doc.applyBrightnessContrast(doc.activeLayerId, brightness, contrast); updateUndoState()
     }
 
-    // ── View ──
-
-    fun updateViewTransform(zoom: Float, pan: Offset, rotation: Float = viewTransform.rotation) {
-        viewTransform = ViewTransform(zoom.coerceIn(0.1f, 10f), pan.x, pan.y, rotation)
-    }
-    fun updateZoom(z: Float) { viewTransform = viewTransform.copy(zoom = z.coerceIn(0.1f, 10f)) }
-    fun updatePanOffset(offset: Offset) { viewTransform = viewTransform.copy(panX = offset.x, panY = offset.y) }
-    fun resetView() { viewTransform = ViewTransform() }
-    fun toggleGrid() { showGrid = !showGrid }
-    fun toggleSymmetry() { symmetryEnabled = !symmetryEnabled }
-
-    // ── Undo / Redo ──
-
-    private fun pushUndo(action: CanvasAction) {
-        undoStack.push(action)
-        redoStack.clear()
+    fun applyBlurFilter(radius: Int) {
+        val doc = _document ?: return
+        doc.applyBlurFilter(doc.activeLayerId, radius); updateUndoState()
     }
 
-    fun undo() {
-        val action = undoStack.pop() ?: return
-        applyUndo(action)
-        redoStack.push(action)
-        strokeVersion++
+    // ── Undo/Redo ───────────────────────────────────────────────────
+
+    fun undo() { _document?.undo(); updateUndoState() }
+    fun redo() { _document?.redo(); updateUndoState() }
+
+    // ── View ────────────────────────────────────────────────────────
+
+    fun resetView() {
+        _zoom = 1f; _panX = 0f; _panY = 0f; _rotation = 0f
+        renderer.pendingTransform.set(floatArrayOf(_zoom, _panX, _panY, _rotation))
     }
 
-    fun redo() {
-        val action = redoStack.pop() ?: return
-        applyRedo(action)
-        undoStack.push(action)
-        strokeVersion++
-    }
+    // ── ファイル操作 ──────────────────────────────────────────────
 
-    private fun applyUndo(action: CanvasAction) {
-        when (action) {
-            is CanvasAction.AddStroke -> {
-                val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) {
-                    val l = layers[idx]
-                    if (l.strokes.isNotEmpty()) layers[idx] = l.copy(strokes = l.strokes.dropLast(1))
-                }
-            }
-            is CanvasAction.AddLayer -> {
-                val idx = layers.indexOfFirst { it.id == action.layer.id }
-                if (idx >= 0) {
-                    layers.removeAt(idx)
-                    if (activeLayerId == action.layer.id && layers.isNotEmpty())
-                        activeLayerId = layers[maxOf(0, idx - 1)].id
-                }
-            }
-            is CanvasAction.RemoveLayer -> {
-                layers.add(minOf(action.index, layers.size), action.layer)
-            }
-            is CanvasAction.ClearLayer -> {
-                val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) layers[idx] = layers[idx].copy(strokes = action.previousStrokes)
-            }
-            is CanvasAction.MergeDown -> {
-                // merged に upper の strokes が付いているので分割
-                val mergedIdx = layers.indexOfFirst { it.id == action.lower.id }
-                if (mergedIdx >= 0) {
-                    layers[mergedIdx] = action.lower
-                    layers.add(mergedIdx + 1, action.upper)
-                    activeLayerId = action.upper.id
-                }
-            }
-            is CanvasAction.DuplicateLayer -> {
-                val idx = layers.indexOfFirst { it.id == action.newLayer.id }
-                if (idx >= 0) {
-                    layers.removeAt(idx)
-                    if (activeLayerId == action.newLayer.id && layers.isNotEmpty())
-                        activeLayerId = layers[maxOf(0, idx - 1)].id
-                }
-            }
-            is CanvasAction.SetLayerFilter -> {
-                val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) layers[idx] = layers[idx].copy(filter = action.previousFilter)
+    private val _isBusy = MutableStateFlow(false)
+    val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
+    private val _statusMessage = MutableStateFlow<String?>(null)
+    val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
+
+    fun clearStatus() { _statusMessage.value = null }
+
+    /** .propaint 形式で保存 */
+    fun savePropaint(outputStream: OutputStream) {
+        val doc = _document ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isBusy.value = true
+            try {
+                FileManager.savePropaint(doc, outputStream)
+                _statusMessage.value = "保存しました"
+            } catch (e: Exception) {
+                _statusMessage.value = "保存エラー: ${e.message}"
+            } finally {
+                outputStream.close()
+                _isBusy.value = false
             }
         }
     }
 
-    private fun applyRedo(action: CanvasAction) {
-        when (action) {
-            is CanvasAction.AddStroke -> {
-                val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) layers[idx] = layers[idx].copy(strokes = layers[idx].strokes + action.stroke)
-            }
-            is CanvasAction.AddLayer -> {
-                layers.add(minOf(action.atIndex, layers.size), action.layer)
-                activeLayerId = action.layer.id
-            }
-            is CanvasAction.RemoveLayer -> {
-                val idx = layers.indexOfFirst { it.id == action.layer.id }
-                if (idx >= 0) layers.removeAt(idx)
-            }
-            is CanvasAction.ClearLayer -> {
-                val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) layers[idx] = layers[idx].copy(strokes = emptyList())
-            }
-            is CanvasAction.MergeDown -> {
-                val lowerIdx = layers.indexOfFirst { it.id == action.lower.id }
-                val upperIdx = layers.indexOfFirst { it.id == action.upper.id }
-                if (lowerIdx >= 0 && upperIdx >= 0) {
-                    layers[lowerIdx] = action.lower.copy(strokes = action.lower.strokes + action.upper.strokes)
-                    layers.removeAt(upperIdx)
-                    activeLayerId = layers[lowerIdx].id
+    /** .propaint 形式から読み込み */
+    fun loadPropaint(inputStream: InputStream) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _isBusy.value = true
+            try {
+                val doc = FileManager.loadPropaint(inputStream)
+                if (doc != null) {
+                    _document = doc
+                    renderer.document = doc
+                    _statusMessage.value = "読み込みました"
+                    launch(Dispatchers.Main) { updateLayerState(); updateUndoState() }
+                    startAutoSave()
+                } else {
+                    _statusMessage.value = "ファイル形式が無効です"
                 }
-            }
-            is CanvasAction.DuplicateLayer -> {
-                layers.add(minOf(action.atIndex, layers.size), action.newLayer)
-                activeLayerId = action.newLayer.id
-            }
-            is CanvasAction.SetLayerFilter -> {
-                val idx = layers.indexOfFirst { it.id == action.layerId }
-                if (idx >= 0) layers[idx] = layers[idx].copy(filter = action.newFilter)
+            } catch (e: Exception) {
+                _statusMessage.value = "読み込みエラー: ${e.message}"
+            } finally {
+                inputStream.close()
+                _isBusy.value = false
             }
         }
     }
 
-    // ── PSD Export ──
-
-    /**
-     * PSD エクスポート用ヘルパー。GlCanvasView から渡されたピクセルデータを元に PSD を書き出す。
-     */
-    fun exportPsdFromPixels(
-        layerPixelData: List<Pair<String, ByteArray>>,
-        canvasWidth: Int,
-        canvasHeight: Int,
-        outputStream: OutputStream,
-    ) {
-        val psdLayers = layerPixelData.mapNotNull { (id, pixels) ->
-            val layer = layers.find { it.id == id } ?: return@mapNotNull null
-            PsdLayerData(
-                name          = layer.name,
-                pixels        = pixels,
-                width         = canvasWidth,
-                height        = canvasHeight,
-                opacity       = layer.opacity,
-                blendMode     = layer.blendMode,
-                isVisible     = layer.isVisible,
-                isClippingMask = layer.isClippingMask,
-            )
+    /** PSD 形式でエクスポート */
+    fun exportPsd(outputStream: OutputStream) {
+        val doc = _document ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isBusy.value = true
+            try {
+                FileManager.exportPsd(doc, outputStream)
+                _statusMessage.value = "PSD エクスポート完了"
+            } catch (e: Exception) {
+                _statusMessage.value = "PSD エラー: ${e.message}"
+            } finally {
+                outputStream.close()
+                _isBusy.value = false
+            }
         }
-        PsdExporter.export(psdLayers, canvasWidth, canvasHeight, outputStream)
     }
 
-    override fun onCleared() {
-        super.onCleared()
-        undoStack.clear()
-        redoStack.clear()
+    /** 画像エクスポート (PNG/JPEG/WebP) */
+    fun exportImage(outputStream: OutputStream, format: FileManager.ImageFormat, quality: Int = 95) {
+        val doc = _document ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isBusy.value = true
+            try {
+                FileManager.exportImage(doc, outputStream, format, quality)
+                _statusMessage.value = "エクスポート完了"
+            } catch (e: Exception) {
+                _statusMessage.value = "エクスポートエラー: ${e.message}"
+            } finally {
+                outputStream.close()
+                _isBusy.value = false
+            }
+        }
+    }
+
+    /** 画像インポート (新しいレイヤーとして追加) */
+    fun importImage(inputStream: InputStream) {
+        val doc = _document ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isBusy.value = true
+            try {
+                val layer = FileManager.importImage(doc, inputStream)
+                if (layer != null) {
+                    _statusMessage.value = "インポートしました"
+                    launch(Dispatchers.Main) { updateLayerState() }
+                } else {
+                    _statusMessage.value = "画像の読み込みに失敗しました"
+                }
+            } catch (e: Exception) {
+                _statusMessage.value = "インポートエラー: ${e.message}"
+            } finally {
+                inputStream.close()
+                _isBusy.value = false
+            }
+        }
+    }
+
+    /** 新しいキャンバス */
+    fun newCanvas(width: Int, height: Int) {
+        val doc = CanvasDocument(width, height)
+        _document = doc; renderer.document = doc; updateLayerState(); updateUndoState()
+        startAutoSave()
+    }
+
+    /** レガシー PNG エクスポート (後方互換) */
+    fun exportPng(outputStream: OutputStream) {
+        exportImage(outputStream, FileManager.ImageFormat.PNG)
+    }
+
+    // ── 内部 ────────────────────────────────────────────────────────
+
+    private fun updateLayerState() {
+        val doc = _document ?: return
+        _layers.value = doc.layers.map {
+            UiLayer(it.id, it.name, it.opacity, it.blendMode,
+                it.isVisible, it.isLocked, it.isClipToBelow, it.id == doc.activeLayerId)
+        }
+    }
+
+    private fun updateUndoState() {
+        val doc = _document ?: return
+        _canUndo.value = doc.canUndo; _canRedo.value = doc.canRedo
     }
 }

@@ -7,93 +7,74 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.MergeType
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.propaint.app.model.LayerBlendMode
-import com.propaint.app.model.PaintLayer
+import com.propaint.app.engine.PixelOps
+import com.propaint.app.ui.UiScale.sdp
+import com.propaint.app.ui.UiScale.ssp
 import com.propaint.app.viewmodel.PaintViewModel
+import com.propaint.app.viewmodel.UiLayer
 
 @Composable
-fun LayerPanel(
-    vm: PaintViewModel,
-    onClose: () -> Unit,
-    onExportPsd: (() -> Unit)? = null,
-) {
-    var editingLayerId by remember { mutableStateOf<String?>(null) }
+fun LayerPanel(viewModel: PaintViewModel, onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+    val layers by viewModel.layers.collectAsState()
 
-    Column(
-        modifier = Modifier
-            .width(260.dp)
-            .fillMaxHeight()
-            .background(Color(0xFF1E1E1E)),
+    Box(
+        modifier = modifier
+            .width(270.sdp)
+            .heightIn(max = 450.sdp)
+            .shadow(16.sdp, RoundedCornerShape(14.sdp))
+            .clip(RoundedCornerShape(14.sdp))
+            .background(Color(0xF01E1E1E)),
     ) {
-        PanelHeader(title = "レイヤー", icon = Icons.Default.Layers, onClose = onClose)
-
-        // Layer list (top layer first)
-        LazyColumn(
-            modifier = Modifier.weight(1f).padding(4.dp),
-        ) {
-            val reversed = vm.layers.reversed()
-            itemsIndexed(reversed, key = { _, l -> l.id }) { _, layer ->
-                val isActive = layer.id == vm.activeLayerId
-                LayerTile(
-                    layer         = layer,
-                    isActive      = isActive,
-                    isEditing     = editingLayerId == layer.id,
-                    onTap         = { vm.selectLayer(layer.id) },
-                    onStartEdit   = { editingLayerId = layer.id },
-                    onRename      = { newName ->
-                        vm.renameLayer(layer.id, newName)
-                        editingLayerId = null
-                    },
-                    onCancelEdit  = { editingLayerId = null },
-                    onVisibility  = { vm.toggleLayerVisibility(layer.id) },
-                    onLock        = { vm.toggleLayerLock(layer.id) },
-                    onOpacity     = { vm.setLayerOpacity(layer.id, it) },
-                    onBlendMode   = { vm.setLayerBlendMode(layer.id, it) },
-                    onClipMask    = { vm.toggleClippingMask(layer.id) },
-                )
-            }
-        }
-
-        // Bottom buttons
-        HorizontalDivider(color = Color(0xFF333333))
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-        ) {
-            SmallIconBtn(Icons.Default.Add, "追加") { vm.addLayer() }
-            SmallIconBtn(Icons.Default.ContentCopy, "複製") { vm.duplicateLayer(vm.activeLayerId) }
-            SmallIconBtn(Icons.AutoMirrored.Filled.MergeType, "結合") { vm.mergeDown(vm.activeLayerId) }
-            SmallIconBtn(Icons.Default.CleaningServices, "クリア") { vm.clearLayer(vm.activeLayerId) }
-            SmallIconBtn(
-                Icons.Default.Delete, "削除",
-                enabled = vm.layers.size > 1,
-            ) { vm.removeLayer(vm.activeLayerId) }
-        }
-        if (onExportPsd != null) {
-            HorizontalDivider(color = Color(0xFF333333))
+        Column {
+            // ── Header ──
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.End,
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 14.sdp, end = 8.sdp, top = 12.sdp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextButton(onClick = onExportPsd) {
-                    Text("PSD出力", fontSize = 12.sp, color = Color(0xFF4A90D9))
+                Text("レイヤー", color = Color.White, fontSize = 13.ssp)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.sdp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Add layer button
+                    Box(
+                        modifier = Modifier
+                            .size(28.sdp)
+                            .clip(RoundedCornerShape(6.sdp))
+                            .background(Color(0xFF6CB4EE).copy(alpha = 0.15f))
+                            .clickable { viewModel.addLayer() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(Icons.Rounded.Add, "Add", tint = Color(0xFF6CB4EE), modifier = Modifier.size(16.sdp))
+                    }
+                    PanelCloseButton(onDismiss)
+                }
+            }
+            Spacer(Modifier.height(6.sdp))
+
+            // ── Layer list ──
+            LazyColumn(
+                contentPadding = PaddingValues(horizontal = 10.sdp, vertical = 0.dp),
+                verticalArrangement = Arrangement.spacedBy(4.sdp),
+                modifier = Modifier.padding(bottom = 10.sdp),
+            ) {
+                itemsIndexed(layers.reversed()) { _, layer ->
+                    LayerItem(layer, viewModel)
                 }
             }
         }
@@ -101,227 +82,184 @@ fun LayerPanel(
 }
 
 @Composable
-private fun LayerTile(
-    layer: PaintLayer,
-    isActive: Boolean,
-    isEditing: Boolean,
-    onTap: () -> Unit,
-    onStartEdit: () -> Unit,
-    onRename: (String) -> Unit,
-    onCancelEdit: () -> Unit,
-    onVisibility: () -> Unit,
-    onLock: () -> Unit,
-    onOpacity: (Float) -> Unit,
-    onBlendMode: (LayerBlendMode) -> Unit,
-    onClipMask: () -> Unit,
-) {
+private fun LayerItem(layer: UiLayer, vm: PaintViewModel) {
+    val bg = if (layer.isActive) Color(0xFF3A5A7C) else Color(0xFF2A2A2A)
+    val borderColor = if (layer.isActive) Color(0xFF6CB4EE) else Color.Transparent
     var expanded by remember { mutableStateOf(false) }
-    var editText by remember(layer.name) { mutableStateOf(layer.name) }
-    val focusRequester = remember { FocusRequester() }
-    val keyboard = LocalSoftwareKeyboardController.current
-
-    LaunchedEffect(isEditing) {
-        if (isEditing) {
-            editText = layer.name
-            focusRequester.requestFocus()
-            keyboard?.show()
-        }
-    }
 
     Column(
-        modifier = Modifier
+        Modifier
             .fillMaxWidth()
-            .padding(vertical = 1.dp)
-            .clip(RoundedCornerShape(6.dp))
-            .background(if (isActive) Color(0xFF2A3A4A) else Color.Transparent)
-            .then(
-                if (isActive) Modifier.border(1.dp, Color(0xFF4A90D9).copy(alpha = 0.4f), RoundedCornerShape(6.dp))
-                else Modifier
-            )
-            .clickable { onTap() }
-            .padding(horizontal = 8.dp, vertical = 6.dp),
+            .clip(RoundedCornerShape(8.sdp))
+            .background(bg)
+            .border(1.dp, borderColor, RoundedCornerShape(8.sdp))
+            .clickable { vm.selectLayer(layer.id) }
+            .padding(8.sdp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // ── Main row ──
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             // Visibility
-            IconButton(onClick = onVisibility, modifier = Modifier.size(24.dp)) {
-                Icon(
-                    if (layer.isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                    null,
-                    tint = if (layer.isVisible) Color.White.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.24f),
-                    modifier = Modifier.size(16.dp),
-                )
-            }
+            MiniIconBtn(
+                icon = if (layer.isVisible) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff,
+                tint = if (layer.isVisible) Color.White else Color(0xFF555555),
+                size = 15.sdp,
+                onClick = { vm.setLayerVisibility(layer.id, !layer.isVisible) },
+            )
+            // Clip
+            MiniIconBtn(
+                icon = Icons.Rounded.ContentCut,
+                tint = if (layer.isClipToBelow) Color(0xFF6CB4EE) else Color(0xFF444444),
+                size = 13.sdp,
+                onClick = { vm.setLayerClip(layer.id, !layer.isClipToBelow) },
+            )
+            // Lock
+            MiniIconBtn(
+                icon = if (layer.isLocked) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                tint = if (layer.isLocked) Color(0xFFFF6B6B) else Color(0xFF444444),
+                size = 13.sdp,
+                onClick = { vm.setLayerLocked(layer.id, !layer.isLocked) },
+            )
 
-            Spacer(Modifier.width(6.dp))
-
-            // Thumbnail
-            Box(
-                Modifier.size(36.dp)
-                    .clip(RoundedCornerShape(4.dp))
-                    .background(Color(0xFF2A2A2A))
-                    .border(1.dp, Color(0xFF444444), RoundedCornerShape(4.dp)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("${layer.strokes.size}", color = Color.White.copy(alpha = 0.38f), fontSize = 10.sp)
-            }
-
-            Spacer(Modifier.width(8.dp))
-
-            // Name and info
-            Column(modifier = Modifier.weight(1f)) {
-                if (isEditing) {
-                    OutlinedTextField(
-                        value         = editText,
-                        onValueChange = { editText = it },
-                        modifier      = Modifier
-                            .fillMaxWidth()
-                            .height(36.dp)
-                            .focusRequester(focusRequester),
-                        singleLine    = true,
-                        textStyle     = LocalTextStyle.current.copy(
-                            color    = Color.White,
-                            fontSize = 12.sp,
-                        ),
-                        colors        = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor   = Color(0xFF4A90D9),
-                            unfocusedBorderColor = Color(0xFF555555),
-                            cursorColor          = Color.White,
-                        ),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                        keyboardActions = KeyboardActions(
-                            onDone = {
-                                keyboard?.hide()
-                                onRename(editText.ifBlank { layer.name })
-                            },
-                        ),
-                    )
-                } else {
-                    Text(
-                        layer.name,
-                        color = if (isActive) Color.White else Color.White.copy(alpha = 0.7f),
-                        fontSize = 13.sp,
-                        fontWeight = if (isActive) androidx.compose.ui.text.font.FontWeight.SemiBold
-                                     else androidx.compose.ui.text.font.FontWeight.Normal,
-                        modifier = Modifier.clickable(onClick = onStartEdit),
-                    )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (layer.isClippingMask) {
-                            Text(
-                                "クリップ",
-                                color    = Color(0xFF4A90D9).copy(alpha = 0.7f),
-                                fontSize = 9.sp,
-                                modifier = Modifier.padding(end = 4.dp),
-                            )
-                        }
-                        Text(
-                            "${layer.blendMode.displayName} · ${(layer.opacity * 100).toInt()}%",
-                            color = Color.White.copy(alpha = 0.38f),
-                            fontSize = 10.sp,
-                        )
-                    }
-                }
-            }
-
-            if (layer.isLocked) {
-                Icon(Icons.Default.Lock, null, tint = Color.White.copy(alpha = 0.38f), modifier = Modifier.size(14.dp))
-                Spacer(Modifier.width(4.dp))
-            }
-
-            IconButton(onClick = { expanded = !expanded }, modifier = Modifier.size(24.dp)) {
-                Icon(
-                    if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                    null, tint = Color.White.copy(alpha = 0.38f), modifier = Modifier.size(18.dp),
-                )
-            }
+            Spacer(Modifier.width(4.sdp))
+            // Name
+            Text(
+                layer.name, color = Color.White, fontSize = 12.ssp,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+            )
+            // Opacity %
+            Text("${(layer.opacity * 100).toInt()}%", color = Color(0xFFAAAAAA), fontSize = 10.ssp)
+            // Expand toggle
+            MiniIconBtn(
+                icon = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                tint = Color(0xFF888888),
+                size = 14.sdp,
+                onClick = { expanded = !expanded },
+            )
         }
 
-        // Expanded settings
+        // ── Expanded details ──
         if (expanded) {
-            Spacer(Modifier.height(8.dp))
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("不透明度", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
+            Spacer(Modifier.height(6.sdp))
+            // Opacity slider
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("不透明度", color = Color(0xFFAAAAAA), fontSize = 10.ssp, modifier = Modifier.width(50.sdp))
                 Slider(
                     value = layer.opacity,
-                    onValueChange = onOpacity,
-                    modifier = Modifier.weight(1f).height(24.dp),
+                    onValueChange = { vm.setLayerOpacity(layer.id, it) },
+                    modifier = Modifier.weight(1f).height(24.sdp),
                     colors = SliderDefaults.colors(
                         thumbColor = Color.White,
-                        activeTrackColor = Color(0xFF4A90D9),
-                        inactiveTrackColor = Color(0xFF333333),
+                        activeTrackColor = Color(0xFF6CB4EE),
+                        inactiveTrackColor = Color(0xFF3A3A3A),
                     ),
                 )
-                Text("${(layer.opacity * 100).toInt()}%", color = Color.White.copy(alpha = 0.54f), fontSize = 10.sp,
-                    modifier = Modifier.width(30.dp))
             }
 
-            // ブレンドモード: 全6種類を2行に分けて表示
-            Text("ブレンド", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
-            Spacer(Modifier.height(4.dp))
-            for (row in LayerBlendMode.entries.chunked(3)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    for (mode in row) {
-                        val sel = mode == layer.blendMode
-                        Text(
-                            mode.displayName,
-                            fontSize = 10.sp,
-                            color = if (sel) Color.White else Color.White.copy(alpha = 0.5f),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(4.dp))
-                                .background(if (sel) Color(0xFF4A90D9) else Color(0xFF333333))
-                                .clickable { onBlendMode(mode) }
-                                .padding(horizontal = 8.dp, vertical = 3.dp),
-                        )
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-            }
-
-            // クリッピングマスク
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("クリッピング", color = Color.White.copy(alpha = 0.54f), fontSize = 11.sp)
-                Spacer(Modifier.weight(1f))
-                Switch(
-                    checked = layer.isClippingMask,
-                    onCheckedChange = { onClipMask() },
-                    modifier = Modifier.height(24.dp),
-                    colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF4A90D9)),
-                )
-            }
-
-            Spacer(Modifier.height(4.dp))
-            Row {
-                TextButton(onClick = onLock, modifier = Modifier.height(28.dp)) {
-                    Text(if (layer.isLocked) "解除" else "ロック", fontSize = 11.sp)
-                }
-                if (isEditing) {
-                    TextButton(
-                        onClick = onCancelEdit,
-                        modifier = Modifier.height(28.dp),
+            // Blend mode
+            var showMenu by remember { mutableStateOf(false) }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("合成", color = Color(0xFFAAAAAA), fontSize = 10.ssp, modifier = Modifier.width(50.sdp))
+                Box {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(5.sdp))
+                            .background(Color(0xFF333333))
+                            .clickable { showMenu = true }
+                            .padding(horizontal = 8.sdp, vertical = 3.sdp),
                     ) {
-                        Text("キャンセル", fontSize = 11.sp, color = Color.White.copy(alpha = 0.5f))
+                        val name = if (layer.blendMode < PixelOps.BLEND_MODE_NAMES.size)
+                            PixelOps.BLEND_MODE_NAMES[layer.blendMode] else "通常"
+                        Text(name, color = Color.White, fontSize = 11.ssp)
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false },
+                    ) {
+                        for (mode in listOf(
+                            PixelOps.BLEND_NORMAL, PixelOps.BLEND_MULTIPLY,
+                            PixelOps.BLEND_SCREEN, PixelOps.BLEND_OVERLAY,
+                            PixelOps.BLEND_DARKEN, PixelOps.BLEND_LIGHTEN,
+                            PixelOps.BLEND_ADD, PixelOps.BLEND_SUBTRACT,
+                            PixelOps.BLEND_SOFT_LIGHT, PixelOps.BLEND_HARD_LIGHT,
+                            PixelOps.BLEND_DIFFERENCE, PixelOps.BLEND_MARKER,
+                        )) {
+                            DropdownMenuItem(
+                                text = { Text(PixelOps.BLEND_MODE_NAMES[mode], fontSize = 12.ssp) },
+                                onClick = { vm.setLayerBlendMode(layer.id, mode); showMenu = false },
+                                modifier = Modifier.height(36.sdp),
+                            )
+                        }
                     }
                 }
+            }
+            Spacer(Modifier.height(4.sdp))
+
+            // Action buttons
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.sdp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                MiniIconBtn(Icons.Rounded.KeyboardArrowUp, Color(0xFF6CB4EE), 16.sdp) { vm.moveLayerUp(layer.id) }
+                MiniIconBtn(Icons.Rounded.KeyboardArrowDown, Color(0xFF6CB4EE), 16.sdp) { vm.moveLayerDown(layer.id) }
+                MiniTextBtn("複製") { vm.duplicateLayer(layer.id) }
+                MiniTextBtn("下に結合") { vm.mergeDown(layer.id) }
+                Spacer(Modifier.weight(1f))
+                MiniIconBtn(Icons.Rounded.Delete, Color(0xFFFF6B6B), 14.sdp) { vm.removeLayer(layer.id) }
+            }
+
+            // Transform buttons
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.sdp),
+            ) {
+                TransformBtn(Icons.Rounded.Flip, "左右反転") { vm.flipLayerHorizontal(layer.id) }
+                TransformBtn(Icons.Rounded.Flip, "上下反転") { vm.flipLayerVertical(layer.id) }
             }
         }
     }
 }
 
 @Composable
-fun SmallIconBtn(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    label: String,
-    enabled: Boolean = true,
+private fun MiniIconBtn(
+    icon: ImageVector,
+    tint: Color,
+    size: androidx.compose.ui.unit.Dp,
     onClick: () -> Unit,
 ) {
-    IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(32.dp)) {
-        Icon(
-            icon, label,
-            tint = if (enabled) Color.White.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.24f),
-            modifier = Modifier.size(18.dp),
-        )
+    Box(
+        modifier = Modifier
+            .size(26.sdp)
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, null, tint = tint, modifier = Modifier.size(size))
+    }
+}
+
+@Composable
+private fun MiniTextBtn(text: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clickable { onClick() }
+            .padding(horizontal = 6.sdp, vertical = 2.sdp),
+    ) {
+        Text(text, fontSize = 10.ssp, color = Color(0xFF6CB4EE))
+    }
+}
+
+@Composable
+private fun TransformBtn(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clickable { onClick() }
+            .padding(horizontal = 4.sdp, vertical = 2.sdp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, tint = Color(0xFF6CB4EE), modifier = Modifier.size(12.sdp))
+            Spacer(Modifier.width(2.sdp))
+            Text(label, fontSize = 10.ssp, color = Color(0xFF6CB4EE))
+        }
     }
 }

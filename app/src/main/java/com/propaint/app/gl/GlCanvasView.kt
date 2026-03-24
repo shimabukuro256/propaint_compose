@@ -2,110 +2,46 @@ package com.propaint.app.gl
 
 import android.content.Context
 import android.opengl.GLSurfaceView
-import android.os.Handler
-import android.os.Looper
+import android.view.MotionEvent
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
 
 /**
- * OpenGL ES 2.0 描画を受け持つ GLSurfaceView ラッパー。
- * Compose の AndroidView からホストされる。
- * タッチ入力は Compose 側 (DrawingCanvas.kt) が処理し、
- * このビューは描画専用。
+ * GLSurfaceView の Compose ラッパー。
+ * タッチ/スタイラス入力を受け取り、コールバックに委譲する。
  */
-class GlCanvasView(context: Context) : GLSurfaceView(context) {
+class PaintGlSurfaceView(
+    context: Context,
+    val renderer: CanvasRenderer,
+) : GLSurfaceView(context) {
 
-    internal val renderer = CanvasGlRenderer()
-    private val mainHandler = Handler(Looper.getMainLooper())
+    var onTouchCallback: ((MotionEvent) -> Boolean)? = null
 
     init {
-        setEGLContextClientVersion(2)
+        setEGLContextClientVersion(3)
         setRenderer(renderer)
-        // 状態変更時のみ描画 (連続描画は不要)
-        renderMode = RENDERMODE_WHEN_DIRTY
+        renderMode = RENDERMODE_CONTINUOUSLY
+        preserveEGLContextOnPause = true
     }
 
-    /**
-     * レンダリングスナップショットを提出し、次フレームの描画をリクエストする。
-     * メインスレッドから呼ぶ。
-     */
-    fun submitSnapshot(snapshot: RenderSnapshot) {
-        renderer.pendingSnapshot.set(snapshot)
-        requestRender()
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        return onTouchCallback?.invoke(event) ?: super.onTouchEvent(event)
     }
+}
 
-    /**
-     * zoom/pan/rotation のみを GL スレッドへ直接届ける高速パス。
-     * Compose の再コンポーズを経由しないため、ピンチ・回転ジェスチャー中でも 60fps を維持できる。
-     * コンテンツ (ストローク/レイヤー) は変化しないことが前提。
-     */
-    fun submitTransformFast(zoom: Float, panX: Float, panY: Float, rotation: Float) {
-        renderer.pendingTransform.set(floatArrayOf(zoom, panX, panY, rotation))
-        requestRender()
-    }
-
-    /**
-     * 水彩ブラシ用: アクティブレイヤーの現在ピクセルを非同期でキャプチャし、
-     * [onReady] をメインスレッドで呼び出す。
-     *
-     * ピクセルデータは RGBA バイト列 (行優先, GL座標: y=0 が下端)。
-     * カラーサンプラー内で canvas_y → gl_y 変換 (height-1-y) が必要。
-     */
-    fun requestWatercolorCapture(
-        layerId: String,
-        onReady: (pixels: ByteArray, width: Int, height: Int) -> Unit,
-    ) {
-        renderer.requestWatercolorCapture(layerId) { bytes, w, h ->
-            mainHandler.post { onReady(bytes, w, h) }
-        }
-        requestRender()
-    }
-
-    /**
-     * スポイト用: コンポジットキャンバスのピクセルを非同期でキャプチャし、
-     * [onReady] をメインスレッドで呼び出す。
-     *
-     * ピクセルデータは RGBA バイト列 (行優先, GL座標: y=0 が下端)。
-     */
-    fun requestCompositeCapture(
-        onReady: (pixels: ByteArray, width: Int, height: Int) -> Unit,
-    ) {
-        renderer.requestCompositeCapture { bytes, w, h ->
-            mainHandler.post { onReady(bytes, w, h) }
-        }
-        requestRender()
-    }
-
-    /**
-     * PSD エクスポート用: 指定レイヤーのピクセルを非同期でキャプチャし、
-     * [onReady] をメインスレッドで呼び出す。
-     */
-    fun requestAllLayersCapture(
-        layerIds: List<String>,
-        onReady: (List<Pair<String, ByteArray>>, Int, Int) -> Unit,
-    ) {
-        renderer.requestAllLayersCapture(layerIds) { list, w, h ->
-            mainHandler.post { onReady(list, w, h) }
-        }
-        requestRender()
-    }
-
-    /**
-     * Layer pixel upload: replaces all GL layer FBOs with the provided pixel data.
-     * Used when loading a saved canvas. [onDone] is called on the main thread.
-     */
-    fun queueLayerPixelUploads(
-        uploads: List<Pair<String, ByteArray>>,
-        width: Int,
-        height: Int,
-        onDone: () -> Unit = {},
-    ) {
-        renderer.queueLayerPixelUploads(uploads, width, height) {
-            mainHandler.post { onDone() }
-        }
-        requestRender()
-    }
-
-    override fun onDetachedFromWindow() {
-        super.onDetachedFromWindow()
-        queueEvent { renderer.cleanup() }
-    }
+@Composable
+fun GlCanvasView(
+    renderer: CanvasRenderer,
+    onTouch: (MotionEvent) -> Boolean,
+    modifier: Modifier = Modifier,
+) {
+    AndroidView(
+        factory = { context ->
+            PaintGlSurfaceView(context, renderer).apply {
+                onTouchCallback = onTouch
+            }
+        },
+        modifier = modifier,
+    )
 }
